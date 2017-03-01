@@ -1,0 +1,99 @@
+
+#ifndef LFHT_H
+#define LFHT_H
+
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdatomic.h>
+
+
+struct lfht_table
+{
+	/* cmpxchg-only; new value may only be NULL, or next->next. */
+	struct lfht_table *_Atomic next;
+	/* synced with something else; "eventually consistent" */
+	size_t elems, deleted;
+	/* atomic decrement only. */
+	ssize_t last_valid;
+
+	/* constants */
+	uintptr_t *table;			/* allocated separately b/c cache hazard */
+	unsigned int size_log2;		/* 1 << size_log2 < SSIZE_MAX */
+	size_t max, max_with_deleted;
+};
+
+
+struct lfht
+{
+	struct lfht_table *_Atomic main;	/* cmpxchg-only */
+
+	/* constants */
+	size_t (*rehash_fn)(const void *ptr, void *priv);
+	void *priv;
+};
+
+
+#define LFHT_INITIALIZER(name, rehash, priv) \
+	{ NULL, (rehash), (priv) }
+
+
+static inline bool lfht_table_valid(struct lfht_table *t) {
+	return t->last_valid >= 0;
+}
+
+
+extern void lfht_init(
+	struct lfht *ht,
+	size_t (*rehash_fn)(const void *ptr, void *priv), void *priv);
+
+extern bool lfht_init_sized(
+	struct lfht *ht,
+	size_t (*rehash_fn)(const void *ptr, void *priv), void *priv,
+	size_t size);
+
+extern void lfht_clear(struct lfht *ht);
+
+/* TODO: lfht_copy(), lfht_rehash() */
+
+extern bool lfht_add(struct lfht *ht, size_t hash, void *p);
+extern bool lfht_del(struct lfht *ht, size_t hash, const void *p);
+
+struct lfht_iter {
+	struct lfht_table *t;
+	size_t off;
+};
+
+extern void *lfht_firstval(
+	const struct lfht *ht, struct lfht_iter *it, size_t hash);
+
+extern void *lfht_nextval(
+	const struct lfht *ht, struct lfht_iter *it, size_t hash);
+
+/* convenience function for retrieving the first matching item. caller must
+ * have an existing epoch bracket, or the returned pointer will be invalid and
+ * the iteration will go into undefined la-la land.
+ */
+static inline void *lfht_get(
+	const struct lfht *ht, size_t hash,
+	bool (*cmp_fn)(const void *cand, void *ptr), const void *ptr)
+{
+	struct lfht_iter it;
+	for(void *cand = lfht_firstval(ht, &it, hash);
+		cand != NULL;
+		cand = lfht_nextval(ht, &it, hash))
+	{
+		if((*cmp_fn)(cand, (void *)ptr)) return cand;
+	}
+	return NULL;
+}
+
+extern void *lfht_first(const struct lfht *ht, struct lfht_iter *it);
+extern void *lfht_next(const struct lfht *ht, struct lfht_iter *it);
+extern void *lfht_prev(const struct lfht *ht, struct lfht_iter *it);
+
+/* returns true if @p was deleted, false otherwise. */
+extern bool lfht_delval(const struct lfht *ht, struct lfht_iter *it, void *p);
+
+
+#endif
