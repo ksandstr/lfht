@@ -26,7 +26,7 @@ extern void e_end(int cookie);
  * invalid during the period, only becoming valid again if the status check
  * didn't indicate restart.
  */
-extern int e_torpor(void);				/* always returns a cookie */
+extern int e_torpor(void);				/* returns a cookie, or -EINVAL */
 extern int e_rouse(int torpor_cookie);	/* 0 for ok, -EAGAIN for restart */
 
 /* library code may assert() this, or against it to mark a definite restart
