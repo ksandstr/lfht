@@ -39,7 +39,7 @@ extern bool e_inside(void);
  */
 #define e_call_dtor(fn, ptr) \
 	_e_call_dtor(typesafe_cb(void, void *, (fn), (ptr)), (ptr))
-extern void _e_call_dtor(void (*dtor_fn)(void *ptr), void *ptr);
+extern void _e_call_dtor(void (*dtor_fn)(void *), void *ptr);
 
 /* wrapper for free(3). */
 extern void e_free(void *ptr);
