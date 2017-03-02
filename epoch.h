@@ -47,7 +47,7 @@ extern void e_free(void *ptr);
 
 /* interface to the C runtime: returns a per-thread free(3)able block of @size
  * bytes, initialized to all zeroes and released with a call to @dtor at
- * thread exit.
+ * thread exit. may never return NULL.
  *
  * default implementation in epoch_pthread.c uses pthread TLS, but things like
  * OS kernels can link in a per-CPU setup instead (and never call @dtor).

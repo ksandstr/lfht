@@ -15,7 +15,6 @@
 int main(void)
 {
 	plan_tests(10);
-	todo_start("wheeee");
 
 	ok1(!e_inside());
 	int eck = e_begin();
