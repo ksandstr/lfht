@@ -34,8 +34,8 @@ extern int e_rouse(int torpor_cookie);	/* 0 for ok, -EAGAIN for restart */
  */
 extern bool e_inside(void);
 
-/* it makes no proper sense to call these outside an epoch bracket, so don't
- * do that.
+/* it makes very little sense to call these from outside an epoch bracket, but
+ * it's ok where necessary. (e.g. the per-client destructor.)
  */
 #define e_call_dtor(fn, ptr) \
 	_e_call_dtor(typesafe_cb(void, void *, (fn), (ptr)), (ptr))
