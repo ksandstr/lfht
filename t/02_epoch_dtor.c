@@ -44,6 +44,21 @@ static void *other_thread_fn(void *barptr)
 }
 
 
+static void *spam_thread_fn(void *unused)
+{
+	for(int i=0; i < 666; i++) {
+		void *spurious = calloc(123 + i, 3);
+		int eck = e_begin();
+		e_free(spurious);
+		e_end(eck);
+
+		if(i % 50 == 0) usleep(500);
+	}
+
+	return NULL;
+}
+
+
 int main(void)
 {
 	plan_tests(3);
@@ -63,12 +78,15 @@ int main(void)
 	in_danger = true;
 	usleep(20);
 	e_call_dtor(&dtor_check, "main");
+	pthread_t spams[12];
+	for(int i=0; i < 12; i++) {
+		pthread_create(&spams[i], NULL, &spam_thread_fn, NULL);
+	}
 	ok1(dtor_calls == 0);
 	e_end(eck);
 	in_danger = false;
 	pthread_barrier_wait(bar);
 
-	todo_start("not implemented");
 	for(int i=0; i < 4; i++) {
 		eck = e_begin();
 		assert(eck >= 0);
@@ -83,6 +101,7 @@ int main(void)
 
 	pthread_barrier_destroy(bar);
 	free(bar);
+	for(int i=0; i < 12; i++) pthread_join(spams[i], NULL);
 
 	return exit_status();
 }
