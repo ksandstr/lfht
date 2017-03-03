@@ -6,6 +6,7 @@
 #include <stdbool.h>
 
 #include "lfht.h"
+#include "epoch.h"
 
 
 #define MIN_SIZE_LOG2 5		/* 2 cachelines' worth */
@@ -53,7 +54,21 @@ bool lfht_init_sized(
 
 void lfht_clear(struct lfht *ht)
 {
-	/* FIXME: leak city! */
+	int eck = e_begin();
+	struct lfht_table *_Atomic *pp = &ht->main;
+	for(;;) {
+		struct lfht_table *tab = atomic_load_explicit(pp,
+			memory_order_relaxed);
+		if(tab == NULL) break;	/* end */
+		if(!atomic_compare_exchange_strong(pp, &tab, NULL)) {
+			/* concurrent lfht_clear(); let it/them run */
+			break;
+		}
+		pp = &tab->next;
+		e_free(tab->table);
+		e_free(tab);	/* NOTE: this doesn't invalidate *pp. */
+	}
+	e_end(eck);
 }
 
 

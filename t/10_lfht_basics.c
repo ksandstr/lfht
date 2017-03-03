@@ -20,7 +20,6 @@ static size_t str_hash_fn(const void *key, void *priv) {
 int main(void)
 {
 	plan_tests(5);
-	todo_start("no implementation!");
 
 	/* you, you double initializer. */
 	struct lfht ht = LFHT_INITIALIZER(ht, &str_hash_fn, NULL);
