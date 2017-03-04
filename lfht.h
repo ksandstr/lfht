@@ -15,7 +15,7 @@ struct lfht_table
 	/* synced with something else; "eventually consistent" */
 	size_t elems, deleted;
 	/* atomic decrement only. */
-	ssize_t last_valid;
+	_Atomic ssize_t last_valid;
 
 	/* constants */
 	uintptr_t *table;			/* allocated separately b/c cache hazard */

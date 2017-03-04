@@ -86,6 +86,31 @@ static struct lfht_table *rehash_table(
 }
 
 
+static struct lfht_table *remove_table(
+	struct lfht_table *list, struct lfht_table *tab)
+{
+	struct lfht_table *_Atomic *pp = &list->next;
+	for(;;) {
+		struct lfht_table *next = atomic_load_explicit(pp,
+			memory_order_relaxed);
+		if(next == NULL) return NULL;
+		if(next == tab) break;
+		pp = &next->next;
+	}
+
+	struct lfht_table *oldtab = tab,
+		*next = atomic_load_explicit(&tab->next, memory_order_relaxed);
+	if(atomic_compare_exchange_strong(pp, &oldtab, next)) {
+		atomic_store_explicit(&tab->last_valid, -1L, memory_order_seq_cst);
+		e_free(tab->table);
+		e_free(tab);
+		return next;
+	} else {
+		return oldtab;
+	}
+}
+
+
 /* TODO: fill this in w/ perfect bits etc. */
 static inline uintptr_t make_hval(
 	struct lfht_table *tab, const void *p, uintptr_t bits)
@@ -127,8 +152,6 @@ static bool ht_add(struct lfht_table *tab, const void *p, size_t h)
 				atomic_fetch_sub_explicit(&tab->deleted, 1,
 					memory_order_relaxed);
 			}
-			atomic_fetch_add_explicit(&tab->elems, 1,
-				memory_order_relaxed);
 			uintptr_t old_e = e;
 retry:
 			if(atomic_compare_exchange_strong_explicit(&tab->table[i], &e, hval,
@@ -143,7 +166,6 @@ retry:
 			} else {
 				/* slot was snatched. */
 				if(old_e == LFHT_DELETED) atomic_fetch_add(&tab->deleted, 1);
-				atomic_fetch_sub(&tab->elems, 1);
 			}
 		}
 	}
@@ -165,6 +187,76 @@ static void *ht_val(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 	}
 
 	return NULL;
+}
+
+
+static bool ht_migrate_entry(
+	struct lfht *ht,
+	struct lfht_table *dst,
+	struct lfht_table **src_p)
+{
+	struct lfht_table *src = *src_p;
+	bool moved = false;
+
+	ssize_t spos;
+	uintptr_t e;
+retry:
+	do {
+		spos = atomic_fetch_sub_explicit(&src->last_valid, 1,
+			memory_order_relaxed);
+		e = atomic_load_explicit(&src->table[spos], memory_order_relaxed);
+	} while(spos > 0 && !entry_is_valid(e));
+
+	if(entry_is_valid(e)) {
+		size_t elems = atomic_fetch_add_explicit(&dst->elems,
+			1, memory_order_relaxed);
+		assert(elems + 1 <= (1ul << dst->size_log2));
+		void *ptr = get_raw_ptr(src, e);
+		size_t hash = (*ht->rehash_fn)(ptr, ht->priv);
+		bool ok = ht_add(dst, ptr, hash);
+		assert(ok);		/* ensured by double/rehash mechanics */
+		if(atomic_compare_exchange_strong_explicit(&src->table[spos],
+			&e, LFHT_DELETED, memory_order_relaxed, memory_order_relaxed))
+		{
+			atomic_fetch_add_explicit(&src->deleted, 1, memory_order_relaxed);
+			atomic_fetch_sub_explicit(&src->elems, 1, memory_order_release);
+			moved = true;
+		} else {
+			/* deleted under our feet. that's fine. */
+			assert(!entry_is_valid(e));
+			/* drop the extra item from wherever it wound up at. */
+			ok = lfht_del(ht, hash, ptr);
+			assert(ok);
+			goto retry;
+		}
+	}
+
+	if(spos == 0) {
+		/* secondary table was cleared. */
+		*src_p = remove_table(dst, src);
+	}
+
+	return moved;
+}
+
+
+/* move one entry from a smaller secondary table into @ht->main (double), or
+ * three from an equal-sized secondary table (rehash). the doubling of size
+ * ensures that the secondary is emptied by the time the primary fills up, and
+ * the doubling threshold's kicking in at 3/4 full means a 3:1 ratio will
+ * achieve the same for rehash.
+ */
+static void ht_migrate(struct lfht *ht, struct lfht_table *tab)
+{
+	struct lfht_table *sec = atomic_load_explicit(&tab->next,
+		memory_order_relaxed);
+	if(sec == NULL) return;
+
+	int n_times = tab->size_log2 > sec->size_log2 ? 1 : 3;
+	for(int i=0; i < n_times; i++) {
+		if(!ht_migrate_entry(ht, tab, &sec)) i--;
+		if(sec == NULL) break;
+	}
 }
 
 
@@ -259,7 +351,7 @@ retry:
 	bool ok = ht_add(tab, p, hash);
 	assert(ok);
 
-	/* TODO: migration! */
+	ht_migrate(ht, tab);
 
 	e_end(eck);
 	return true;
