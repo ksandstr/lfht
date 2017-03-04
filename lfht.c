@@ -364,7 +364,19 @@ fail:
 
 bool lfht_delval(const struct lfht *ht, struct lfht_iter *it, void *p)
 {
-	return false;
+	uintptr_t e = atomic_load_explicit(&it->t->table[it->off],
+		memory_order_relaxed);
+	if(get_raw_ptr(it->t, e) == p
+		&& atomic_compare_exchange_strong_explicit(
+			&it->t->table[it->off], &e, LFHT_DELETED,
+			memory_order_relaxed, memory_order_relaxed))
+	{
+		atomic_fetch_add_explicit(&it->t->deleted, 1, memory_order_relaxed);
+		atomic_fetch_sub_explicit(&it->t->elems, 1, memory_order_release);
+		return true;
+	} else {
+		return false;
+	}
 }
 
 

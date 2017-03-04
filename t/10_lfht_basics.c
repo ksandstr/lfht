@@ -58,7 +58,6 @@ int main(void)
 	bool ok = lfht_add(&ht, hash_string("foo"), "foo");
 	ok(ok, "add `foo'");
 	ok1(str_in(&ht, "foo"));
-	todo_start("deletion not implemented");
 	ok = lfht_del(&ht, hash_string("foo"), "foo");
 	ok(ok, "del `foo'");
 	ok = lfht_del(&ht, hash_string("foo"), "foo");
