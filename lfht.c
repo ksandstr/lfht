@@ -364,6 +364,8 @@ fail:
 
 bool lfht_delval(const struct lfht *ht, struct lfht_iter *it, void *p)
 {
+	assert(e_inside());
+
 	uintptr_t e = atomic_load_explicit(&it->t->table[it->off],
 		memory_order_relaxed);
 	if(get_raw_ptr(it->t, e) == p
@@ -382,14 +384,20 @@ bool lfht_delval(const struct lfht *ht, struct lfht_iter *it, void *p)
 
 bool lfht_del(struct lfht *ht, size_t hash, const void *p)
 {
+	int eck = e_begin();
+	bool found = false;
 	struct lfht_iter it;
 	for(void *c = lfht_firstval(ht, &it, hash);
 		c != NULL;
 		c = lfht_nextval(ht, &it, hash))
 	{
-		if(c == p && lfht_delval(ht, &it, c)) return true;
+		if(c == p && lfht_delval(ht, &it, c)) {
+			found = true;
+			break;
+		}
 	}
-	return false;
+	e_end(eck);
+	return found;
 }
 
 
@@ -441,17 +449,20 @@ void *lfht_nextval(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 
 void *lfht_first(const struct lfht *ht, struct lfht_iter *it)
 {
+	assert(e_inside());
 	return NULL;
 }
 
 
 void *lfht_next(const struct lfht *ht, struct lfht_iter *it)
 {
+	assert(e_inside());
 	return NULL;
 }
 
 
 void *lfht_prev(const struct lfht *ht, struct lfht_iter *it)
 {
+	assert(e_inside());
 	return NULL;
 }
