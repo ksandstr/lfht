@@ -17,9 +17,21 @@ static size_t str_hash_fn(const void *key, void *priv) {
 }
 
 
+static bool cmp_str_ptr(const void *cand, void *ref) {
+	return strcmp(cand, ref) == 0;
+}
+
+
+static bool str_in(struct lfht *ht, const char *str) {
+	const char *s = lfht_get(ht, hash_string(str), &cmp_str_ptr, str);
+	assert(s == NULL || strcmp(s, str) == 0);
+	return s != NULL;
+}
+
+
 int main(void)
 {
-	plan_tests(5);
+	plan_tests(5 + 6);
 
 	/* you, you double initializer. */
 	struct lfht ht = LFHT_INITIALIZER(ht, &str_hash_fn, NULL);
@@ -39,7 +51,21 @@ int main(void)
 		pass("survived clear after lfht_init_sized(..., %d)", sizes[i]);
 	}
 
-	/* TODO: tests on add, get, del. */
+	/* get, add, get, del, and get again. */
+	int eck = e_begin();
+	lfht_init(&ht, &str_hash_fn, NULL);
+	ok1(!str_in(&ht, "foo"));
+	bool ok = lfht_add(&ht, hash_string("foo"), "foo");
+	ok(ok, "add `foo'");
+	ok1(str_in(&ht, "foo"));
+	todo_start("deletion not implemented");
+	ok = lfht_del(&ht, hash_string("foo"), "foo");
+	ok(ok, "del `foo'");
+	ok = lfht_del(&ht, hash_string("foo"), "foo");
+	ok(!ok, "!del `foo'");
+	ok1(!str_in(&ht, "foo"));
+	lfht_clear(&ht);
+	e_end(eck);
 
 	return exit_status();
 }
