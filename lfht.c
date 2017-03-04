@@ -4,12 +4,168 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
+#include <assert.h>
+
+#include <ccan/likely/likely.h>
 
 #include "lfht.h"
 #include "epoch.h"
 
 
+#define LFHT_DELETED (uintptr_t)1
+
 #define MIN_SIZE_LOG2 5		/* 2 cachelines' worth */
+
+
+static inline bool entry_is_valid(uintptr_t e) {
+	return e > LFHT_DELETED;
+}
+
+
+static struct lfht_table *new_table(int sizelog2)
+{
+	struct lfht_table *tab = aligned_alloc(64, sizeof(*tab));
+	if(tab == NULL) return NULL;
+	tab->next = NULL;
+	tab->elems = 0; tab->deleted = 0;
+	tab->last_valid = (1L << sizelog2) - 1;
+	tab->size_log2 = sizelog2;
+	tab->table = calloc(1L << sizelog2, sizeof(uintptr_t));
+	if(tab->table == NULL) {
+		free(tab);
+		return NULL;
+	}
+	/* from CCAN htable */
+	tab->max = ((size_t)3 << sizelog2) / 4;
+	tab->max_with_deleted = ((size_t)9 << sizelog2) / 10;
+
+	return tab;
+}
+
+
+/* install a new table, twice the size of @tab, in @ht. if malloc fails,
+ * return NULL. if replacement fails, and the new one is larger than @tab,
+ * return that; if it's not larger, redo with that instead of @tab.
+ */
+static struct lfht_table *double_table(
+	struct lfht *ht, struct lfht_table *tab)
+{
+	struct lfht_table *nt = new_table(tab->size_log2 + 1);
+	if(nt == NULL) return NULL;
+
+	for(;;) {
+		nt->next = tab;
+		if(atomic_compare_exchange_strong(&ht->main, &tab, nt)) return nt;
+		else if(tab->size_log2 >= nt->size_log2) {
+			/* resized by another thread. */
+			free(nt->table);
+			free(nt);
+			return tab;
+		}
+		/* was replaced by rehash. doubling remains appropriate. */
+	}
+}
+
+
+/* install a new table of exactly the same size. ht_add() will migrate two
+ * items at a time while the new table remains @ht->main. if malloc fails,
+ * return @tab; if switching fails, return the new table.
+ */
+static struct lfht_table *rehash_table(
+	struct lfht *ht, struct lfht_table *tab)
+{
+	struct lfht_table *nt = new_table(tab->size_log2);
+	if(nt == NULL) return tab;
+	if(atomic_compare_exchange_strong(&ht->main, &tab, nt)) tab = nt;
+	else {
+		free(nt->table);
+		free(nt);
+	}
+	return tab;
+}
+
+
+/* TODO: fill this in w/ perfect bits etc. */
+static inline uintptr_t make_hval(
+	struct lfht_table *tab, const void *p, uintptr_t bits)
+{
+	assert(bits == 0);
+	assert(entry_is_valid((uintptr_t)p));
+	return (uintptr_t)p;
+}
+
+
+/* TODO: as above */
+static inline uintptr_t get_hash_ptr_bits(
+	struct lfht_table *tab, size_t hash)
+{
+	return 0;
+}
+
+
+/* TODO: as above */
+static inline void *get_raw_ptr(const struct lfht_table *tab, uintptr_t e)
+{
+	return (void *)e;
+}
+
+
+static bool ht_add(struct lfht_table *tab, const void *p, size_t h)
+{
+	size_t mask = (1ul << tab->size_log2) - 1;
+	uintptr_t perfect = 0;
+	for(size_t i = h & mask, j = 0; j <= mask; i = (i + 1) & mask, j++) {
+		uintptr_t e = atomic_load_explicit(&tab->table[i],
+			memory_order_relaxed);
+		if(entry_is_valid(e)) perfect = 0;
+		else {
+			uintptr_t hval = make_hval(tab, p,
+				get_hash_ptr_bits(tab, h) | perfect);
+			/* optimistic. */
+			if(e == LFHT_DELETED) {
+				atomic_fetch_sub_explicit(&tab->deleted, 1,
+					memory_order_relaxed);
+			}
+			atomic_fetch_add_explicit(&tab->elems, 1,
+				memory_order_relaxed);
+			uintptr_t old_e = e;
+retry:
+			if(atomic_compare_exchange_strong_explicit(&tab->table[i], &e, hval,
+				memory_order_release, memory_order_relaxed))
+			{
+				return true;
+			} else if(!entry_is_valid(e)) {
+				/* exotic case: an empty slot was filled, then deleted. try
+				 * again but fancily.
+				 */
+				goto retry;
+			} else {
+				/* slot was snatched. */
+				if(old_e == LFHT_DELETED) atomic_fetch_add(&tab->deleted, 1);
+				atomic_fetch_sub(&tab->elems, 1);
+			}
+		}
+	}
+	return false;
+}
+
+
+static void *ht_val(const struct lfht *ht, struct lfht_iter *it, size_t hash)
+{
+	uintptr_t mask = (1ul << it->t->size_log2) - 1;
+	for(size_t j=0; j <= mask; j++) {
+		uintptr_t e = atomic_load_explicit(&it->t->table[it->off],
+			memory_order_relaxed);
+		if(e == 0) break;
+		if(e != LFHT_DELETED) {
+			return get_raw_ptr(it->t, e);
+		}
+		it->off = (it->off + 1) & mask;
+	}
+
+	return NULL;
+}
 
 
 void lfht_init(
@@ -32,23 +188,12 @@ bool lfht_init_sized(
 		sizelog2++;
 		if(sizelog2 == sizeof(long) * 8 - 1) break;
 	}
-	struct lfht_table *tab = aligned_alloc(64, sizeof(*tab));
+	struct lfht_table *tab = new_table(sizelog2);
 	if(tab == NULL) return false;
-	tab->next = NULL;
-	tab->elems = 0; tab->deleted = 0;
-	tab->last_valid = (1L << sizelog2) - 1;
-	tab->size_log2 = sizelog2;
-	tab->table = calloc(1L << sizelog2, sizeof(uintptr_t));
-	if(tab->table == NULL) {
-		free(tab);
-		return false;
+	else {
+		atomic_store_explicit(&ht->main, tab, memory_order_release);
+		return true;
 	}
-	/* from CCAN htable */
-	tab->max = ((size_t)3 << sizelog2) / 4;
-	tab->max_with_deleted = ((size_t)9 << sizelog2) / 10;
-
-	atomic_store_explicit(&ht->main, tab, memory_order_release);
-	return true;
 }
 
 
@@ -74,6 +219,53 @@ void lfht_clear(struct lfht *ht)
 
 bool lfht_add(struct lfht *ht, size_t hash, void *p)
 {
+	int eck = e_begin();
+
+	struct lfht_table *tab = atomic_load_explicit(&ht->main, memory_order_relaxed);
+	if(unlikely(tab == NULL)) {
+		tab = new_table(MIN_SIZE_LOG2);
+		if(tab == NULL) goto fail;
+		struct lfht_table *old = NULL;
+		if(!atomic_compare_exchange_strong(&ht->main, &old, tab)) {
+			free(tab->table);
+			free(tab);
+			tab = old;
+		}
+	}
+
+	/* ensure @tab has room for the new item, and won't fill up concurrently.
+	 * if it would've filled up, add the next size of table. this is
+	 * non-terminating under pathological circumstances, where room for the
+	 * new element is instantly consumed by concurrent access.
+	 */
+	size_t elems;
+
+retry:
+	elems = atomic_fetch_add_explicit(&tab->elems, 1, memory_order_relaxed);
+	if(elems + 1 > tab->max) {
+		atomic_fetch_sub_explicit(&tab->elems, 1, memory_order_relaxed);
+		tab = double_table(ht, tab);
+		if(tab == NULL) goto fail;
+		goto retry;
+	} else if(elems + 1 + tab->deleted > tab->max_with_deleted) {
+		struct lfht_table *oldtab = tab;
+		tab = rehash_table(ht, tab);
+		if(tab != oldtab) {
+			atomic_fetch_sub_explicit(&oldtab->elems, 1, memory_order_relaxed);
+			goto retry;
+		}
+	}
+
+	bool ok = ht_add(tab, p, hash);
+	assert(ok);
+
+	/* TODO: migration! */
+
+	e_end(eck);
+	return true;
+
+fail:
+	e_end(eck);
 	return false;
 }
 
@@ -99,13 +291,47 @@ bool lfht_del(struct lfht *ht, size_t hash, const void *p)
 
 void *lfht_firstval(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 {
-	return NULL;
+	assert(e_inside());
+
+	it->t = atomic_load_explicit(&ht->main, memory_order_relaxed);
+	if(unlikely(it->t == NULL)) return NULL;
+	for(;;) {
+		it->off = hash & ((1ul << it->t->size_log2) - 1);
+		void *val = ht_val(ht, it, hash);
+		if(val != NULL) return val;
+		else {
+			/* next table plz */
+			it->t = atomic_load_explicit(&it->t->next, memory_order_relaxed);
+			if(it->t == NULL) return NULL;
+		}
+	}
 }
 
 
 void *lfht_nextval(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 {
-	return NULL;
+	assert(e_inside());
+
+	if(unlikely(it->t == NULL)) return NULL;
+
+	/* next offset in same table. */
+	uintptr_t mask = (1ul << it->t->size_log2) - 1;
+	it->off = (it->off + 1) & mask;
+	void *ptr;
+	if(it->off != (hash & mask) && (ptr = ht_val(ht, it, hash)) != NULL) {
+		return ptr;
+	}
+
+	/* go to next table and try again, etc. */
+	do {
+		it->t = atomic_load_explicit(&it->t->next, memory_order_relaxed);
+		if(it->t == NULL) return NULL;
+		mask = (1ul << it->t->size_log2) - 1;
+		it->off = hash & mask;
+		ptr = ht_val(ht, it, hash);
+	} while(ptr == NULL);
+
+	return ptr;
 }
 
 
