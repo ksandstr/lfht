@@ -214,33 +214,43 @@ static void ht_migrate_entry(
 	ssize_t spos = atomic_fetch_sub_explicit(&src->last_valid, 1,
 		memory_order_relaxed);
 	uintptr_t e = atomic_load_explicit(&src->table[spos], memory_order_relaxed);
-retry:
+e_retry:
 	if(!entry_is_valid(e)) {
 		if(!atomic_compare_exchange_strong_explicit(&src->table[spos],
 			&e, LFHT_NOT_AVAIL, memory_order_release, memory_order_relaxed))
 		{
 			/* a concurrent ht_add() filled it in. try again. */
-			goto retry;
+			goto e_retry;
 		}
 	} else {
-		size_t elems = atomic_fetch_add_explicit(&dst->elems,
-			1, memory_order_relaxed);
+		size_t elems;
+
+dst_retry:
+		elems = atomic_fetch_add_explicit(&dst->elems, 1,
+			memory_order_relaxed);
 		assert(elems + 1 <= (1ul << dst->size_log2));
 		void *ptr = get_raw_ptr(src, e);
 		size_t hash = (*ht->rehash_fn)(ptr, ht->priv);
+		/* !ok implies concurrent migration from @dst. */
 		bool ok = ht_add(dst, ptr, hash);
-		assert(ok);		/* ensured by double/rehash mechanics */
-		if(atomic_compare_exchange_strong_explicit(&src->table[spos],
+		if(ok && atomic_compare_exchange_strong_explicit(&src->table[spos],
 			&e, LFHT_DELETED, memory_order_relaxed, memory_order_relaxed))
 		{
 			atomic_fetch_add_explicit(&src->deleted, 1, memory_order_relaxed);
 			atomic_fetch_sub_explicit(&src->elems, 1, memory_order_release);
-		} else {
+		} else if(ok) {
 			/* deleted under our feet. that's fine. */
 			assert(!entry_is_valid(e));
 			/* drop the extra item from wherever it wound up at. */
 			ok = lfht_del(ht, hash, ptr);
 			assert(ok);
+		} else {
+			/* @dst was made secondary. refetch and try again. */
+			struct lfht_table *rarest = atomic_load_explicit(&ht->main,
+				memory_order_relaxed);
+			assert(rarest != dst);
+			dst = rarest;
+			goto dst_retry;
 		}
 	}
 
@@ -325,7 +335,8 @@ bool lfht_add(struct lfht *ht, size_t hash, void *p)
 {
 	int eck = e_begin();
 
-	struct lfht_table *tab = atomic_load_explicit(&ht->main, memory_order_relaxed);
+	struct lfht_table *tab = atomic_load_explicit(&ht->main,
+		memory_order_relaxed);
 	if(unlikely(tab == NULL)) {
 		tab = new_table(MIN_SIZE_LOG2);
 		if(tab == NULL) goto fail;
@@ -360,8 +371,14 @@ retry:
 		}
 	}
 
-	bool ok = ht_add(tab, p, hash);
-	assert(ok);
+	if(!ht_add(tab, p, hash)) {
+		/* tab was made secondary and migration twilight reached where @hash
+		 * would land. undo and retry to avoid a further off-cpu migration.
+		 */
+		atomic_fetch_sub_explicit(&tab->elems, 1, memory_order_relaxed);
+		tab = atomic_load_explicit(&ht->main, memory_order_relaxed);
+		goto retry;
+	}
 
 	ht_migrate(ht, tab);
 
