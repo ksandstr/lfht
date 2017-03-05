@@ -1,6 +1,4 @@
 
-#define _ISOC11_SOURCE
-
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -14,6 +12,7 @@
 
 
 #define LFHT_DELETED (uintptr_t)1
+#define LFHT_NOT_AVAIL (~(uintptr_t)0)
 
 #define MIN_SIZE_LOG2 5		/* 2 cachelines' worth */
 
@@ -180,7 +179,7 @@ static void *ht_val(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 		uintptr_t e = atomic_load_explicit(&it->t->table[it->off],
 			memory_order_relaxed);
 		if(e == 0) break;
-		if(e != LFHT_DELETED) {
+		if(e != LFHT_DELETED && e != LFHT_NOT_AVAIL) {
 			return get_raw_ptr(it->t, e);
 		}
 		it->off = (it->off + 1) & mask;
@@ -201,8 +200,15 @@ static void ht_migrate_entry(
 	ssize_t spos = atomic_fetch_sub_explicit(&src->last_valid, 1,
 		memory_order_relaxed);
 	uintptr_t e = atomic_load_explicit(&src->table[spos], memory_order_relaxed);
-
-	if(entry_is_valid(e)) {
+retry:
+	if(!entry_is_valid(e)) {
+		if(!atomic_compare_exchange_strong_explicit(&src->table[spos],
+			&e, LFHT_NOT_AVAIL, memory_order_release, memory_order_relaxed))
+		{
+			/* a concurrent ht_add() filled it in. try again. */
+			goto retry;
+		}
+	} else {
 		size_t elems = atomic_fetch_add_explicit(&dst->elems,
 			1, memory_order_relaxed);
 		assert(elems + 1 <= (1ul << dst->size_log2));
