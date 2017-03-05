@@ -138,9 +138,9 @@ static inline void *get_raw_ptr(const struct lfht_table *tab, uintptr_t e)
 static bool ht_add(struct lfht_table *tab, const void *p, size_t hash)
 {
 	uintptr_t perfect = 0;
-	size_t mask = (1ul << tab->size_log2) - 1, start = hash & mask,
-		last_valid = atomic_load_explicit(&tab->last_valid,
-			memory_order_relaxed);
+	size_t mask = (1ul << tab->size_log2) - 1, start = hash & mask;
+	ssize_t last_valid = atomic_load_explicit(&tab->last_valid,
+		memory_order_relaxed);
 	if(start > last_valid) start = 0;
 	size_t i = start;
 	do {
@@ -419,7 +419,7 @@ static inline void lfht_iter_init(
 {
 	it->t = tab;
 	it->start = hash & ((1ul << it->t->size_log2) - 1);
-	size_t last_valid = atomic_load_explicit(&it->t->last_valid,
+	ssize_t last_valid = atomic_load_explicit(&it->t->last_valid,
 		memory_order_relaxed);
 	if(it->start > last_valid) it->start = 0;
 	it->off = it->start;
@@ -456,7 +456,7 @@ void *lfht_nextval(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 	/* next offset in same table. */
 	uintptr_t mask = (1ul << it->t->size_log2) - 1;
 	it->off = (it->off + 1) & mask;
-	size_t last_valid = atomic_load_explicit(&it->t->last_valid,
+	ssize_t last_valid = atomic_load_explicit(&it->t->last_valid,
 		memory_order_relaxed);
 	if(it->off > last_valid) {
 		if(unlikely(it->start > last_valid)) {
