@@ -190,22 +190,17 @@ static void *ht_val(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 }
 
 
-static bool ht_migrate_entry(
+/* check the next entry in *@src_p, and migrate it if valid. */
+static void ht_migrate_entry(
 	struct lfht *ht,
 	struct lfht_table *dst,
 	struct lfht_table **src_p)
 {
 	struct lfht_table *src = *src_p;
-	bool moved = false;
 
-	ssize_t spos;
-	uintptr_t e;
-retry:
-	do {
-		spos = atomic_fetch_sub_explicit(&src->last_valid, 1,
-			memory_order_relaxed);
-		e = atomic_load_explicit(&src->table[spos], memory_order_relaxed);
-	} while(spos > 0 && !entry_is_valid(e));
+	ssize_t spos = atomic_fetch_sub_explicit(&src->last_valid, 1,
+		memory_order_relaxed);
+	uintptr_t e = atomic_load_explicit(&src->table[spos], memory_order_relaxed);
 
 	if(entry_is_valid(e)) {
 		size_t elems = atomic_fetch_add_explicit(&dst->elems,
@@ -220,14 +215,12 @@ retry:
 		{
 			atomic_fetch_add_explicit(&src->deleted, 1, memory_order_relaxed);
 			atomic_fetch_sub_explicit(&src->elems, 1, memory_order_release);
-			moved = true;
 		} else {
 			/* deleted under our feet. that's fine. */
 			assert(!entry_is_valid(e));
 			/* drop the extra item from wherever it wound up at. */
 			ok = lfht_del(ht, hash, ptr);
 			assert(ok);
-			goto retry;
 		}
 	}
 
@@ -235,16 +228,15 @@ retry:
 		/* secondary table was cleared. */
 		*src_p = remove_table(dst, src);
 	}
-
-	return moved;
 }
 
 
-/* move one entry from a smaller secondary table into @ht->main (double), or
- * three from an equal-sized secondary table (rehash). the doubling of size
- * ensures that the secondary is emptied by the time the primary fills up, and
- * the doubling threshold's kicking in at 3/4 full means a 3:1 ratio will
- * achieve the same for rehash.
+/* examine and possibly migrate one entry from a smaller secondary table into
+ * @ht->main (double), or three from an equal-sized secondary table (rehash).
+ * the doubling of size ensures that the secondary is emptied by the time the
+ * primary fills up, and the doubling threshold's kicking in at 3/4 full means
+ * a 3:1 ratio will achieve the same for rehash (if significantly ahead of
+ * time).
  */
 static void ht_migrate(struct lfht *ht, struct lfht_table *tab)
 {
@@ -254,7 +246,7 @@ static void ht_migrate(struct lfht *ht, struct lfht_table *tab)
 
 	int n_times = tab->size_log2 > sec->size_log2 ? 1 : 3;
 	for(int i=0; i < n_times; i++) {
-		if(!ht_migrate_entry(ht, tab, &sec)) i--;
+		ht_migrate_entry(ht, tab, &sec);
 		if(sec == NULL) break;
 	}
 }
