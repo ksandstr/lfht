@@ -135,17 +135,29 @@ static inline void *get_raw_ptr(const struct lfht_table *tab, uintptr_t e)
 }
 
 
-static bool ht_add(struct lfht_table *tab, const void *p, size_t h)
+static bool ht_add(struct lfht_table *tab, const void *p, size_t hash)
 {
-	size_t mask = (1ul << tab->size_log2) - 1;
 	uintptr_t perfect = 0;
-	for(size_t i = h & mask, j = 0; j <= mask; i = (i + 1) & mask, j++) {
+	size_t mask = (1ul << tab->size_log2) - 1, start = hash & mask,
+		last_valid = atomic_load_explicit(&tab->last_valid,
+			memory_order_relaxed);
+	if(start > last_valid) start = 0;
+	size_t i = start;
+	do {
 		uintptr_t e = atomic_load_explicit(&tab->table[i],
 			memory_order_relaxed);
-		if(entry_is_valid(e)) perfect = 0;
-		else {
+		if(entry_is_valid(e)) {
+			if(e == LFHT_NOT_AVAIL) {
+				/* optimization: not-avail means @tab is secondary, so
+				 * ht_add() should be tried again on the primary. this avoids
+				 * an off-cpu migration, so it's worth it.
+				 */
+				return false;
+			}
+			perfect = 0;
+		} else {
 			uintptr_t hval = make_hval(tab, p,
-				get_hash_ptr_bits(tab, h) | perfect);
+				get_hash_ptr_bits(tab, hash) | perfect);
 			/* optimistic. */
 			if(e == LFHT_DELETED) {
 				atomic_fetch_sub_explicit(&tab->deleted, 1,
@@ -167,7 +179,9 @@ retry:
 				if(old_e == LFHT_DELETED) atomic_fetch_add(&tab->deleted, 1);
 			}
 		}
-	}
+		i = (i + 1) & mask;
+		if(i > last_valid) i = 0;
+	} while(i != start);
 	return false;
 }
 
@@ -399,20 +413,35 @@ bool lfht_del(struct lfht *ht, size_t hash, const void *p)
 }
 
 
+/* initialize for a new @tab. */
+static inline void lfht_iter_init(
+	struct lfht_iter *it, struct lfht_table *tab, size_t hash)
+{
+	it->t = tab;
+	it->start = hash & ((1ul << it->t->size_log2) - 1);
+	size_t last_valid = atomic_load_explicit(&it->t->last_valid,
+		memory_order_relaxed);
+	if(it->start > last_valid) it->start = 0;
+	it->off = it->start;
+}
+
+
 void *lfht_firstval(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 {
 	assert(e_inside());
 
-	it->t = atomic_load_explicit(&ht->main, memory_order_relaxed);
-	if(unlikely(it->t == NULL)) return NULL;
+	struct lfht_table *tab = atomic_load_explicit(&ht->main,
+		memory_order_relaxed);
+	if(unlikely(tab == NULL)) return NULL;
+	lfht_iter_init(it, tab, hash);
 	for(;;) {
-		it->off = hash & ((1ul << it->t->size_log2) - 1);
 		void *val = ht_val(ht, it, hash);
 		if(val != NULL) return val;
 		else {
 			/* next table plz */
-			it->t = atomic_load_explicit(&it->t->next, memory_order_relaxed);
-			if(it->t == NULL) return NULL;
+			tab = atomic_load_explicit(&it->t->next, memory_order_relaxed);
+			if(tab == NULL) return NULL;
+			lfht_iter_init(it, tab, hash);
 		}
 	}
 }
@@ -427,17 +456,30 @@ void *lfht_nextval(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 	/* next offset in same table. */
 	uintptr_t mask = (1ul << it->t->size_log2) - 1;
 	it->off = (it->off + 1) & mask;
+	size_t last_valid = atomic_load_explicit(&it->t->last_valid,
+		memory_order_relaxed);
+	if(it->off > last_valid) {
+		if(unlikely(it->start > last_valid)) {
+			/* the case where last_valid drops below it->start: hitting the
+			 * twilight zone sends us to the next table.
+			 */
+			it->off = it->start;
+		} else {
+			it->off = 0;
+		}
+	}
+
 	void *ptr;
-	if(it->off != (hash & mask) && (ptr = ht_val(ht, it, hash)) != NULL) {
+	if(it->off != it->start && (ptr = ht_val(ht, it, hash)) != NULL) {
 		return ptr;
 	}
 
-	/* go to next table and try again, etc. */
+	/* go to next table, etc. */
 	do {
-		it->t = atomic_load_explicit(&it->t->next, memory_order_relaxed);
-		if(it->t == NULL) return NULL;
-		mask = (1ul << it->t->size_log2) - 1;
-		it->off = hash & mask;
+		struct lfht_table *tab = atomic_load_explicit(&it->t->next,
+			memory_order_relaxed);
+		if(tab == NULL) return NULL;
+		lfht_iter_init(it, tab, hash);
 		ptr = ht_val(ht, it, hash);
 	} while(ptr == NULL);
 

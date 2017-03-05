@@ -61,7 +61,7 @@ extern bool lfht_del(struct lfht *ht, size_t hash, const void *p);
 
 struct lfht_iter {
 	struct lfht_table *t;
-	size_t off;
+	size_t off, start;
 };
 
 extern void *lfht_firstval(
