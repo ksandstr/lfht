@@ -176,7 +176,7 @@ retry:
 static void *ht_val(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 {
 	uintptr_t mask = (1ul << it->t->size_log2) - 1;
-	for(size_t j=0; j <= mask; j++) {
+	do {
 		uintptr_t e = atomic_load_explicit(&it->t->table[it->off],
 			memory_order_relaxed);
 		if(e == 0) break;
@@ -184,7 +184,7 @@ static void *ht_val(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 			return get_raw_ptr(it->t, e);
 		}
 		it->off = (it->off + 1) & mask;
-	}
+	} while(it->off != (hash & mask));
 
 	return NULL;
 }
