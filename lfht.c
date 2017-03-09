@@ -76,6 +76,7 @@ static struct lfht_table *rehash_table(
 {
 	struct lfht_table *nt = new_table(tab->size_log2);
 	if(nt == NULL) return tab;
+	nt->next = tab;
 	if(atomic_compare_exchange_strong(&ht->main, &tab, nt)) tab = nt;
 	else {
 		free(nt->table);
