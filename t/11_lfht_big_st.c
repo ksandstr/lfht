@@ -43,13 +43,17 @@ static char *gen_string(int seed)
 
 int main(void)
 {
-	plan_tests(3);
+	plan_tests(4);
 
 	int eck = e_begin();
 	struct lfht ht = LFHT_INITIALIZER(ht, &str_hash_fn, NULL);
-	bool found_immed = true, found_delay = true;
+	bool found_before = false, found_immed = true, found_delay = true;
 	for(int i=0; i < 10000; i++) {
 		char *s = gen_string(i);
+		if(!found_before && str_in(&ht, s)) {
+			diag("found `%s' before it was added", s);
+			found_before = true;
+		}
 		bool ok = lfht_add(&ht, hash_string(s), s);
 		assert(ok);
 		if(found_immed && !str_in(&ht, s)) {
@@ -72,6 +76,7 @@ int main(void)
 		}
 	}
 	pass("add loop didn't crash");
+	ok(!found_before, "test strings weren't found before add");
 	ok(found_immed, "test strings were found immediately");
 	ok(found_delay, "test strings were found with delay");
 
