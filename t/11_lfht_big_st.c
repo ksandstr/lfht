@@ -43,7 +43,7 @@ static char *gen_string(int seed)
 
 int main(void)
 {
-	plan_tests(4);
+	plan_tests(3);
 
 	int eck = e_begin();
 	struct lfht ht = LFHT_INITIALIZER(ht, &str_hash_fn, NULL);
@@ -75,7 +75,6 @@ int main(void)
 			eck = e_begin();
 		}
 	}
-	pass("add loop didn't crash");
 	ok(!found_before, "test strings weren't found before add");
 	ok(found_immed, "test strings were found immediately");
 	ok(found_delay, "test strings were found with delay");
@@ -85,4 +84,3 @@ int main(void)
 
 	return exit_status();
 }
-
