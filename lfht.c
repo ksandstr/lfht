@@ -109,7 +109,8 @@ static struct lfht_table *new_table(int sizelog2)
  * returns NULL on malloc() failure.
  */
 static struct lfht_table *remask_table(
-	struct lfht *ht, struct lfht_table *tab, void *model)
+	struct lfht *ht, struct lfht_table *tab, void *model,
+	bool overwrite_masks)
 {
 	assert(model != NULL);
 
@@ -117,7 +118,7 @@ static struct lfht_table *remask_table(
 	if(nt == NULL) return NULL;
 
 	for(;;) {
-		set_bits(nt, tab, model);
+		set_bits(nt, overwrite_masks ? NULL : tab, model);
 		nt->next = tab;
 		if(atomic_compare_exchange_strong(&ht->main, &tab, nt)) {
 			/* i won! i won! */
@@ -169,7 +170,7 @@ static struct lfht_table *double_table(
 		&& ((uintptr_t)model & tab->common_mask) != tab->common_bits)
 	{
 		/* replace it w/ same size, but conformant. */
-		return remask_table(ht, tab, model);
+		return remask_table(ht, tab, model, false);
 	} else {
 		/* it's acceptable. */
 		return tab;
@@ -489,7 +490,8 @@ bool lfht_add(struct lfht *ht, size_t hash, void *p)
 retry:
 	elems = atomic_fetch_add_explicit(&tab->elems, 1, memory_order_relaxed);
 	if(((uintptr_t)p & tab->common_mask) != tab->common_bits) {
-		tab = remask_table(ht, tab, p);
+		atomic_fetch_sub_explicit(&tab->elems, 1, memory_order_relaxed);
+		tab = remask_table(ht, tab, p, elems == 0);
 		if(tab == NULL) goto fail;
 		goto retry;
 	} else if(elems + 1 > tab->max) {
