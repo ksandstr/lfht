@@ -434,6 +434,7 @@ bool lfht_init_sized(
 	struct lfht_table *tab = new_table(sizelog2);
 	if(tab == NULL) return false;
 	else {
+		set_bits(tab, NULL, NULL);
 		atomic_store_explicit(&ht->main, tab, memory_order_release);
 		return true;
 	}

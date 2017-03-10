@@ -47,8 +47,12 @@ int main(void)
 	for(int i=0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
 		memset(&ht, 0xfd - i, sizeof(ht));
 		lfht_init_sized(&ht, &str_hash_fn, NULL, sizes[i]);
+		bool ok = lfht_add(&ht, hash_string("foo"), "foo");
+		assert(ok);
+		ok = lfht_add(&ht, hash_string("bar"), "bar");
+		assert(ok);
 		lfht_clear(&ht);
-		pass("survived clear after lfht_init_sized(..., %d)", sizes[i]);
+		pass("survived simple adds after lfht_init_sized(..., %d)", sizes[i]);
 	}
 
 	/* get, add, get, del, and get again. */
