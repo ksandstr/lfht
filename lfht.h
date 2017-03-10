@@ -19,6 +19,11 @@ struct lfht_table
 
 	/* constants */
 	uintptr_t *table;			/* allocated separately b/c cache hazard */
+	/* common_mask indicates bits that're the same across all keys;
+	 * common_bits specifies what those bits are. perfect_bit, when nonzero,
+	 * is always set in common_mask, and cleared in common_bits.
+	 */
+	uintptr_t common_mask, common_bits, perfect_bit;
 	unsigned int size_log2;		/* 1 << size_log2 < SSIZE_MAX */
 	size_t max, max_with_deleted;
 };
@@ -62,6 +67,7 @@ extern bool lfht_del(struct lfht *ht, size_t hash, const void *p);
 struct lfht_iter {
 	struct lfht_table *t;
 	size_t off, start;
+	uintptr_t perfect;
 };
 
 extern void *lfht_firstval(

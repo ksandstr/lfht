@@ -22,8 +22,69 @@ static inline bool entry_is_valid(uintptr_t e) {
 }
 
 
+static uintptr_t get_perfect_bit(uintptr_t mask)
+{
+	/* deviate from CCAN htable by preferring very high-order bits. */
+	for(int i = sizeof(uintptr_t) * 8 - 1; i >= 0; i--) {
+		uintptr_t try = (uintptr_t)1 << i;
+		if((mask & try) != 0) return try;
+	}
+	return 0;
+}
+
+
+static void set_bits(
+	struct lfht_table *tab, const struct lfht_table *prev, void *model)
+{
+	if(prev == NULL) {
+		/* punch MIN_SIZE_LOG2 - 1 bits' worth of holes in the common mask
+		 * above typical malloc grain of 32 bytes.
+		 */
+		tab->common_mask = (~(uintptr_t)0 << (MIN_SIZE_LOG2 + 4)) | 0x1f;
+		tab->perfect_bit = get_perfect_bit(tab->common_mask);
+		if(model != NULL) tab->common_bits = (uintptr_t)model;
+		else {
+			/* synthesize a typical common value that the allocator is likely
+			 * to hand out. lfht_add() recognizes the case where this is
+			 * wrong, i.e. elems == 0 and common_bits conflicts with the
+			 * incoming value, and adapts.
+			 */
+			void *ptr = malloc(1);
+			if(ptr == NULL) tab->common_bits = (uintptr_t)tab;	/* or worse */
+			else {
+				tab->common_bits = (uintptr_t)ptr;
+				free(ptr);
+			}
+		}
+		tab->common_bits &= tab->common_mask;
+	} else {
+		tab->common_mask = prev->common_mask;
+		tab->common_bits = prev->common_bits;
+		tab->perfect_bit = prev->perfect_bit;
+
+		uintptr_t m = (uintptr_t)model;
+		if(model != NULL && (m & tab->common_mask) != tab->common_bits) {
+			uintptr_t new = tab->common_bits ^ (m & tab->common_mask);
+			assert((new & tab->common_mask) != 0);
+			tab->common_mask &= ~new;
+			tab->common_bits &= ~new;
+			assert((m & tab->common_mask) == tab->common_bits);
+			assert((tab->common_bits & ~tab->common_mask) == 0);
+			if((tab->perfect_bit & tab->common_mask) == 0) {
+				tab->perfect_bit = get_perfect_bit(tab->common_mask);
+			}
+		}
+	}
+	assert(model == NULL
+		|| ((uintptr_t)model & tab->common_mask) == tab->common_bits);
+	assert(tab->perfect_bit == 0
+		|| (tab->perfect_bit & tab->common_mask) != 0);
+}
+
+
 static struct lfht_table *new_table(int sizelog2)
 {
+	assert(sizelog2 >= MIN_SIZE_LOG2);
 	struct lfht_table *tab = aligned_alloc(64, sizeof(*tab));
 	if(tab == NULL) return NULL;
 	tab->next = NULL;
@@ -35,6 +96,7 @@ static struct lfht_table *new_table(int sizelog2)
 		free(tab);
 		return NULL;
 	}
+
 	/* from CCAN htable */
 	tab->max = ((size_t)3 << sizelog2) / 4;
 	tab->max_with_deleted = ((size_t)9 << sizelog2) / 10;
@@ -43,26 +105,74 @@ static struct lfht_table *new_table(int sizelog2)
 }
 
 
+/* install a new @ht->main until its common mask & bits accommodate @model.
+ * returns NULL on malloc() failure.
+ */
+static struct lfht_table *remask_table(
+	struct lfht *ht, struct lfht_table *tab, void *model)
+{
+	assert(model != NULL);
+
+	struct lfht_table *nt = new_table(tab->size_log2);
+	if(nt == NULL) return NULL;
+
+	for(;;) {
+		set_bits(nt, tab, model);
+		nt->next = tab;
+		if(atomic_compare_exchange_strong(&ht->main, &tab, nt)) {
+			/* i won! i won! */
+			return nt;
+		} else if(((uintptr_t)model & tab->common_mask) == tab->common_bits) {
+			/* concurrently replaced with a conforming table, superceding
+			 * ours.
+			 */
+			free(nt->table);
+			free(nt);
+			return tab;
+		} else if(tab->size_log2 > nt->size_log2) {
+			/* concurrently doubled. reallocate ours & retry. */
+			free(nt->table);
+			free(nt);
+			nt = new_table(tab->size_log2);
+			if(nt == NULL) return NULL;
+		} else {
+			/* concurrent remask or rehash. retry w/ same table. */
+		}
+	}
+}
+
+
 /* install a new table, twice the size of @tab, in @ht. if malloc fails,
  * return NULL. if replacement fails, and the new one is larger than @tab,
  * return that; if it's not larger, redo with that instead of @tab.
  */
 static struct lfht_table *double_table(
-	struct lfht *ht, struct lfht_table *tab)
+	struct lfht *ht, struct lfht_table *tab, void *model)
 {
 	struct lfht_table *nt = new_table(tab->size_log2 + 1);
 	if(nt == NULL) return NULL;
 
 	for(;;) {
+		set_bits(nt, tab, model);
 		nt->next = tab;
 		if(atomic_compare_exchange_strong(&ht->main, &tab, nt)) return nt;
 		else if(tab->size_log2 >= nt->size_log2) {
 			/* resized by another thread. */
 			free(nt->table);
 			free(nt);
-			return tab;
+			break;
 		}
 		/* was replaced by rehash. doubling remains appropriate. */
+	}
+
+	if(model != NULL
+		&& ((uintptr_t)model & tab->common_mask) != tab->common_bits)
+	{
+		/* replace it w/ same size, but conformant. */
+		return remask_table(ht, tab, model);
+	} else {
+		/* it's acceptable. */
+		return tab;
 	}
 }
 
@@ -111,34 +221,45 @@ static struct lfht_table *remove_table(
 }
 
 
-/* TODO: fill this in w/ perfect bits etc. */
 static inline uintptr_t make_hval(
-	struct lfht_table *tab, const void *p, uintptr_t bits)
+	const struct lfht_table *tab, const void *p, uintptr_t bits)
 {
-	assert(bits == 0);
 	assert(entry_is_valid((uintptr_t)p));
-	return (uintptr_t)p;
+	return ((uintptr_t)p & ~tab->common_mask) | bits;
 }
 
 
-/* TODO: as above */
 static inline uintptr_t get_hash_ptr_bits(
-	struct lfht_table *tab, size_t hash)
+	const struct lfht_table *tab, size_t hash)
 {
-	return 0;
+	/* mixes @hash back into itself to utilize the size_log2 bits that'd
+	 * otherwise be disregarded, and to spread a 32-bit hash into the extra
+	 * bits on 64-bit hosts. deviates from CCAN htable by rotating to the
+	 * right, whereas CCAN does a simple shift.
+	 */
+	int n = tab->size_log2 + 4;
+	return (hash ^ ((hash >> n) | (hash << (sizeof(hash) * 8 - n))))
+		& tab->common_mask & ~tab->perfect_bit;
 }
 
 
-/* TODO: as above */
-static inline void *get_raw_ptr(const struct lfht_table *tab, uintptr_t e)
+static inline uintptr_t get_extra_ptr_bits(
+	const struct lfht_table *tab, uintptr_t e)
 {
-	return (void *)e;
+	return e & tab->common_mask;
+}
+
+
+static inline void *get_raw_ptr(const struct lfht_table *tab, uintptr_t e) {
+	return (void *)((e & ~tab->common_mask) | tab->common_bits);
 }
 
 
 static bool ht_add(struct lfht_table *tab, const void *p, size_t hash)
 {
-	uintptr_t perfect = 0;
+	assert(((uintptr_t)p & tab->common_mask) == tab->common_bits);
+	assert((tab->common_bits & tab->perfect_bit) == 0);
+	uintptr_t perfect = tab->perfect_bit;
 	size_t mask = (1ul << tab->size_log2) - 1, start = hash & mask;
 	ssize_t last_valid = atomic_load_explicit(&tab->last_valid,
 		memory_order_relaxed);
@@ -157,15 +278,15 @@ static bool ht_add(struct lfht_table *tab, const void *p, size_t hash)
 			}
 			perfect = 0;
 		} else {
-			uintptr_t hval = make_hval(tab, p,
-				get_hash_ptr_bits(tab, hash) | perfect);
-			/* optimistic. */
+			uintptr_t hval;
+
+retry:
+			hval = make_hval(tab, p, get_hash_ptr_bits(tab, hash) | perfect);
 			if(e == LFHT_DELETED) {
 				atomic_fetch_sub_explicit(&tab->deleted, 1,
 					memory_order_relaxed);
 			}
 			uintptr_t old_e = e;
-retry:
 			if(atomic_compare_exchange_strong_explicit(&tab->table[i], &e, hval,
 				memory_order_release, memory_order_relaxed))
 			{
@@ -174,9 +295,10 @@ retry:
 				/* exotic case: an empty slot was filled, then deleted. try
 				 * again but fancily.
 				 */
+				assert(old_e != LFHT_DELETED);
 				goto retry;
 			} else {
-				/* slot was snatched. */
+				/* slot was snatched. undo and keep going. */
 				if(old_e == LFHT_DELETED) atomic_fetch_add(&tab->deleted, 1);
 			}
 		}
@@ -187,17 +309,23 @@ retry:
 }
 
 
-static void *ht_val(const struct lfht *ht, struct lfht_iter *it, size_t hash)
+static void *ht_val(
+	const struct lfht *ht, struct lfht_iter *it, size_t hash)
 {
-	uintptr_t mask = (1ul << it->t->size_log2) - 1;
+	uintptr_t mask = (1ul << it->t->size_log2) - 1,
+		perfect = it->perfect,
+		h2 = get_hash_ptr_bits(it->t, hash) | perfect;
 	do {
 		uintptr_t e = atomic_load_explicit(&it->t->table[it->off],
 			memory_order_relaxed);
 		if(e == 0) break;
 		if(e != LFHT_DELETED && e != LFHT_NOT_AVAIL) {
-			return get_raw_ptr(it->t, e);
+			if(get_extra_ptr_bits(it->t, e) == h2) {
+				return get_raw_ptr(it->t, e);
+			}
 		}
 		it->off = (it->off + 1) & mask;
+		h2 &= ~perfect;
 	} while(it->off != (hash & mask));
 
 	return NULL;
@@ -341,6 +469,7 @@ bool lfht_add(struct lfht *ht, size_t hash, void *p)
 	if(unlikely(tab == NULL)) {
 		tab = new_table(MIN_SIZE_LOG2);
 		if(tab == NULL) goto fail;
+		set_bits(tab, NULL, p);
 		struct lfht_table *old = NULL;
 		if(!atomic_compare_exchange_strong(&ht->main, &old, tab)) {
 			free(tab->table);
@@ -358,9 +487,13 @@ bool lfht_add(struct lfht *ht, size_t hash, void *p)
 
 retry:
 	elems = atomic_fetch_add_explicit(&tab->elems, 1, memory_order_relaxed);
-	if(elems + 1 > tab->max) {
+	if(((uintptr_t)p & tab->common_mask) != tab->common_bits) {
+		tab = remask_table(ht, tab, p);
+		if(tab == NULL) goto fail;
+		goto retry;
+	} else if(elems + 1 > tab->max) {
 		atomic_fetch_sub_explicit(&tab->elems, 1, memory_order_relaxed);
-		tab = double_table(ht, tab);
+		tab = double_table(ht, tab, p);
 		if(tab == NULL) goto fail;
 		goto retry;
 	} else if(elems + 1 + tab->deleted > tab->max_with_deleted) {
@@ -439,7 +572,11 @@ static inline void lfht_iter_init(
 	it->start = hash & ((1ul << it->t->size_log2) - 1);
 	ssize_t last_valid = atomic_load_explicit(&it->t->last_valid,
 		memory_order_relaxed);
-	if(it->start > last_valid) it->start = 0;
+	it->perfect = tab->perfect_bit;
+	if(it->start > last_valid) {
+		it->start = 0;
+		it->perfect = 0;
+	}
 	it->off = it->start;
 }
 
@@ -472,6 +609,7 @@ void *lfht_nextval(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 	if(unlikely(it->t == NULL)) return NULL;
 
 	/* next offset in same table. */
+	it->perfect = 0;
 	uintptr_t mask = (1ul << it->t->size_log2) - 1;
 	it->off = (it->off + 1) & mask;
 	ssize_t last_valid = atomic_load_explicit(&it->t->last_valid,
