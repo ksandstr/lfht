@@ -15,7 +15,7 @@ struct lfht_table
 	/* synced with something else; "eventually consistent" */
 	size_t elems, deleted;
 	/* atomic decrement only. */
-	_Atomic ssize_t last_valid;
+	_Atomic ssize_t mig_next, mig_left;
 
 	/* constants */
 	uintptr_t *table;			/* allocated separately b/c cache hazard */
@@ -42,11 +42,6 @@ struct lfht
 
 #define LFHT_INITIALIZER(name, rehash, priv) \
 	{ NULL, (rehash), (priv) }
-
-
-static inline bool lfht_table_valid(struct lfht_table *t) {
-	return t->last_valid >= 0;
-}
 
 
 extern void lfht_init(

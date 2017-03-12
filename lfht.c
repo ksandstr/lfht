@@ -12,13 +12,19 @@
 
 
 #define LFHT_DELETED (uintptr_t)1
-#define LFHT_NOT_AVAIL (~(uintptr_t)0)
+#define LFHT_NA_FULL (~(uintptr_t)0)
+#define LFHT_NA_EMPTY (LFHT_NA_FULL & ~(uintptr_t)1)
 
 #define MIN_SIZE_LOG2 5		/* 2 cachelines' worth */
 
 
 static inline bool entry_is_valid(uintptr_t e) {
 	return e > LFHT_DELETED;
+}
+
+
+static inline bool entry_is_avail(uintptr_t e) {
+	return e != LFHT_NA_FULL && e != LFHT_NA_EMPTY;
 }
 
 
@@ -95,7 +101,8 @@ static struct lfht_table *new_table(int sizelog2)
 	if(tab == NULL) return NULL;
 	tab->next = NULL;
 	tab->elems = 0; tab->deleted = 0;
-	tab->last_valid = (1L << sizelog2) - 1;
+	tab->mig_left = 1L << sizelog2;
+	tab->mig_next = (1L << sizelog2) - 1;
 	tab->size_log2 = sizelog2;
 	tab->gen_id = 0;
 	tab->table = calloc(1L << sizelog2, sizeof(uintptr_t));
@@ -289,22 +296,18 @@ static bool ht_add(struct lfht_table *tab, const void *p, size_t hash)
 	assert((tab->common_bits & tab->perfect_bit) == 0);
 	uintptr_t perfect = tab->perfect_bit;
 	size_t mask = (1ul << tab->size_log2) - 1, start = hash & mask;
-	ssize_t last_valid = atomic_load_explicit(&tab->last_valid,
-		memory_order_relaxed);
-	if(start > last_valid) start = 0;
 	size_t i = start;
 	do {
 		uintptr_t e = atomic_load_explicit(&tab->table[i],
 			memory_order_relaxed);
 		if(entry_is_valid(e)) {
-			if(e == LFHT_NOT_AVAIL) {
+			if(!entry_is_avail(e)) {
 				/* optimization: not-avail means @tab is secondary, so
 				 * ht_add() should be tried again on the primary. this avoids
 				 * an off-cpu migration, so it's worth it.
 				 */
 				return false;
 			}
-			perfect = 0;
 		} else {
 			uintptr_t hval;
 
@@ -331,7 +334,7 @@ retry:
 			}
 		}
 		i = (i + 1) & mask;
-		if(i > last_valid) i = 0;
+		perfect = 0;
 	} while(i != start);
 	return false;
 }
@@ -346,8 +349,8 @@ static void *ht_val(
 	do {
 		uintptr_t e = atomic_load_explicit(&it->t->table[it->off],
 			memory_order_relaxed);
-		if(e == 0) break;
-		if(e != LFHT_DELETED && e != LFHT_NOT_AVAIL) {
+		if(e == 0 || e == LFHT_NA_EMPTY) break;
+		if(e != LFHT_DELETED && e != LFHT_NA_FULL) {
 			if(get_extra_ptr_bits(it->t, e) == h2) {
 				return get_raw_ptr(it->t, e);
 			}
@@ -368,23 +371,27 @@ static void ht_migrate_entry(
 {
 	struct lfht_table *src = *src_p;
 
-	ssize_t spos = atomic_fetch_sub_explicit(&src->last_valid, 1,
-		memory_order_relaxed);
+	ssize_t spos = atomic_fetch_sub_explicit(&src->mig_next, 1,
+		memory_order_consume);
 	if(spos < 0) {
 		/* src was already emptied. go down the list. */
 		do {
-			*src_p = atomic_load_explicit(&src->next, memory_order_relaxed);
-		} while(*src_p != NULL && atomic_load(&(*src_p)->last_valid) < 0);
+			src = atomic_load_explicit(&src->next, memory_order_relaxed);
+		} while(src != NULL && atomic_load(&src->mig_next) < 0);
+		*src_p = src;
 		return;
 	}
 
 	uintptr_t e = atomic_load_explicit(&src->table[spos], memory_order_relaxed);
 e_retry:
 	if(!entry_is_valid(e)) {
+		uintptr_t new = e == 0 ? LFHT_NA_EMPTY : LFHT_NA_FULL;
 		if(!atomic_compare_exchange_strong_explicit(&src->table[spos],
-			&e, LFHT_NOT_AVAIL, memory_order_release, memory_order_relaxed))
+			&e, new, memory_order_release, memory_order_relaxed))
 		{
 			/* a concurrent ht_add() filled it in. try again. */
+			assert(entry_is_valid(e));
+			assert(entry_is_avail(e));
 			goto e_retry;
 		}
 	} else {
@@ -399,18 +406,20 @@ dst_retry:
 		/* !ok implies concurrent migration from @dst. */
 		bool ok = ht_add(dst, ptr, hash);
 		if(ok && atomic_compare_exchange_strong_explicit(&src->table[spos],
-			&e, LFHT_DELETED, memory_order_relaxed, memory_order_relaxed))
+			&e, LFHT_NA_FULL, memory_order_relaxed, memory_order_relaxed))
 		{
-			atomic_fetch_add_explicit(&src->deleted, 1, memory_order_relaxed);
 			atomic_fetch_sub_explicit(&src->elems, 1, memory_order_release);
 		} else if(ok) {
 			/* deleted under our feet. that's fine. */
 			assert(!entry_is_valid(e));
+			assert(entry_is_avail(e));
 			/* drop the extra item from wherever it wound up at. */
 			ok = lfht_del(ht, hash, ptr);
 			assert(ok);
+			goto e_retry;
 		} else {
 			/* @dst was made secondary. refetch and try again. */
+			atomic_fetch_sub_explicit(&dst->elems, 1, memory_order_relaxed);
 			struct lfht_table *rarest = atomic_load_explicit(&ht->main,
 				memory_order_relaxed);
 			assert(rarest != dst);
@@ -419,8 +428,11 @@ dst_retry:
 		}
 	}
 
-	if(spos == 0) {
-		/* secondary table was cleared. */
+	if(atomic_fetch_sub_explicit(&src->mig_left, 1,
+		memory_order_relaxed) == 1)
+	{
+		/* migration has completed, the table should be removed. */
+		assert(src->mig_next <= 0);
 		*src_p = remove_table(dst, src);
 	}
 }
@@ -539,7 +551,7 @@ retry:
 	} else if(elems + 1 + tab->deleted > tab->max_with_deleted) {
 		struct lfht_table *oldtab = tab;
 		tab = rehash_table(ht, tab);
-		if(tab != oldtab) {
+		if(likely(tab != oldtab)) {
 			atomic_fetch_sub_explicit(&oldtab->elems, 1, memory_order_relaxed);
 			goto retry;
 		}
@@ -574,10 +586,10 @@ bool lfht_delval(const struct lfht *ht, struct lfht_iter *it, void *p)
 	if(get_raw_ptr(it->t, e) == p
 		&& atomic_compare_exchange_strong_explicit(
 			&it->t->table[it->off], &e, LFHT_DELETED,
-			memory_order_relaxed, memory_order_relaxed))
+			memory_order_release, memory_order_relaxed))
 	{
 		atomic_fetch_add_explicit(&it->t->deleted, 1, memory_order_relaxed);
-		atomic_fetch_sub_explicit(&it->t->elems, 1, memory_order_release);
+		atomic_fetch_sub_explicit(&it->t->elems, 1, memory_order_relaxed);
 		return true;
 	} else {
 		return false;
@@ -610,13 +622,7 @@ static inline void lfht_iter_init(
 {
 	it->t = tab;
 	it->start = hash & ((1ul << it->t->size_log2) - 1);
-	ssize_t last_valid = atomic_load_explicit(&it->t->last_valid,
-		memory_order_relaxed);
 	it->perfect = tab->perfect_bit;
-	if(it->start > last_valid) {
-		it->start = 0;
-		it->perfect = 0;
-	}
 	it->off = it->start;
 }
 
@@ -678,18 +684,6 @@ void *lfht_nextval(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 	it->perfect = 0;
 	uintptr_t mask = (1ul << it->t->size_log2) - 1;
 	it->off = (it->off + 1) & mask;
-	ssize_t last_valid = atomic_load_explicit(&it->t->last_valid,
-		memory_order_relaxed);
-	if(it->off > last_valid) {
-		if(unlikely(it->start > last_valid)) {
-			/* the case where last_valid drops below it->start: hitting the
-			 * twilight zone sends us to the next table.
-			 */
-			it->off = it->start;
-		} else {
-			it->off = 0;
-		}
-	}
 
 	void *ptr;
 	if(it->off != it->start && (ptr = ht_val(ht, it, hash)) != NULL) {
