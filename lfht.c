@@ -82,6 +82,12 @@ static void set_bits(
 }
 
 
+/* FIXME: handle the case where gen_id wraps around by compressing gen_ids
+ * from far up. this is rather unlikely to matter for now, but is absolutely
+ * critical for multi-year stability, since rehashing will continue
+ * indefinitely in a lfht under load. (this comment is here because setting
+ * gen_id happens at the new_table() callsites, which are several.)
+ */
 static struct lfht_table *new_table(int sizelog2)
 {
 	assert(sizelog2 >= MIN_SIZE_LOG2);
@@ -91,6 +97,7 @@ static struct lfht_table *new_table(int sizelog2)
 	tab->elems = 0; tab->deleted = 0;
 	tab->last_valid = (1L << sizelog2) - 1;
 	tab->size_log2 = sizelog2;
+	tab->gen_id = 0;
 	tab->table = calloc(1L << sizelog2, sizeof(uintptr_t));
 	if(tab->table == NULL) {
 		free(tab);
@@ -119,6 +126,7 @@ static struct lfht_table *remask_table(
 	for(;;) {
 		set_bits(nt, tab, model);
 		nt->next = tab;
+		nt->gen_id = tab->gen_id + 1;
 		if(atomic_compare_exchange_strong(&ht->main, &tab, nt)) {
 			/* i won! i won! */
 			return nt;
@@ -155,6 +163,7 @@ static struct lfht_table *double_table(
 	for(;;) {
 		set_bits(nt, tab, model);
 		nt->next = tab;
+		nt->gen_id = tab->gen_id + 1;
 		if(atomic_compare_exchange_strong(&ht->main, &tab, nt)) return nt;
 		else if(tab->size_log2 >= nt->size_log2) {
 			/* resized by another thread. */
@@ -187,6 +196,7 @@ static struct lfht_table *rehash_table(
 	struct lfht_table *nt = new_table(tab->size_log2);
 	if(nt == NULL) return tab;
 	nt->next = tab;
+	nt->gen_id = tab->gen_id + 1;
 	if(atomic_compare_exchange_strong(&ht->main, &tab, nt)) tab = nt;
 	else {
 		free(nt->table);
@@ -211,7 +221,6 @@ static struct lfht_table *remove_table(
 	struct lfht_table *oldtab = tab,
 		*next = atomic_load_explicit(&tab->next, memory_order_relaxed);
 	if(atomic_compare_exchange_strong(pp, &oldtab, next)) {
-		atomic_store_explicit(&tab->last_valid, -1L, memory_order_seq_cst);
 		e_free(tab->table);
 		e_free(tab);
 		return next;
@@ -591,20 +600,46 @@ static inline void lfht_iter_init(
 }
 
 
+/* finds table that has the lowest gen_id greater than @prev->gen_id. returns
+ * NULL when @prev == @ht->main.
+ */
+static struct lfht_table *next_table_gen(
+	const struct lfht *ht, const struct lfht_table *prev)
+{
+	unsigned long prev_gen = prev->gen_id;
+	struct lfht_table *next,
+		*t = atomic_load_explicit(&ht->main, memory_order_relaxed);
+	assert(t != NULL);
+	if(t == prev) return NULL;
+	for(;;) {
+		next = atomic_load_explicit(&t->next, memory_order_relaxed);
+		if(next == NULL || next->gen_id <= prev_gen) break;
+		t = next;
+	}
+
+	return t;
+}
+
+
 void *lfht_firstval(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 {
 	assert(e_inside());
 
-	struct lfht_table *tab = atomic_load_explicit(&ht->main,
+	struct lfht_table *next, *tab = atomic_load_explicit(&ht->main,
 		memory_order_relaxed);
 	if(unlikely(tab == NULL)) return NULL;
+	do {
+		next = atomic_load_explicit(&tab->next, memory_order_relaxed);
+		if(next != NULL) tab = next;
+	} while(next != NULL);
+
 	lfht_iter_init(it, tab, hash);
 	for(;;) {
 		void *val = ht_val(ht, it, hash);
 		if(val != NULL) return val;
 		else {
 			/* next table plz */
-			tab = atomic_load_explicit(&it->t->next, memory_order_relaxed);
+			tab = next_table_gen(ht, it->t);
 			if(tab == NULL) return NULL;
 			lfht_iter_init(it, tab, hash);
 		}
@@ -642,8 +677,7 @@ void *lfht_nextval(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 
 	/* go to next table, etc. */
 	do {
-		struct lfht_table *tab = atomic_load_explicit(&it->t->next,
-			memory_order_relaxed);
+		struct lfht_table *tab = next_table_gen(ht, it->t);
 		if(tab == NULL) return NULL;
 		lfht_iter_init(it, tab, hash);
 		ptr = ht_val(ht, it, hash);

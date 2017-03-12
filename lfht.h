@@ -25,6 +25,7 @@ struct lfht_table
 	 */
 	uintptr_t common_mask, common_bits, perfect_bit;
 	unsigned int size_log2;		/* 1 << size_log2 < SSIZE_MAX */
+	unsigned long gen_id;		/* next == NULL || gen_id > next->gen_id */
 	size_t max, max_with_deleted;
 };
 
