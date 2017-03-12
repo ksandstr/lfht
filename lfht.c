@@ -420,7 +420,9 @@ static void ht_migrate(struct lfht *ht, struct lfht_table *tab)
 		memory_order_relaxed);
 	if(sec == NULL) return;
 
-	int n_times = tab->size_log2 > sec->size_log2 ? 1 : 3;
+	int n_times = tab->size_log2 > sec->size_log2
+			&& atomic_load_explicit(&sec->next, memory_order_relaxed) == NULL
+		? 1 : 3;
 	for(int i=0; i < n_times; i++) {
 		ht_migrate_entry(ht, tab, &sec);
 		if(sec == NULL) break;
