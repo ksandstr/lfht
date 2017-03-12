@@ -343,6 +343,14 @@ static void ht_migrate_entry(
 
 	ssize_t spos = atomic_fetch_sub_explicit(&src->last_valid, 1,
 		memory_order_relaxed);
+	if(spos < 0) {
+		/* src was already emptied. go down the list. */
+		do {
+			*src_p = atomic_load_explicit(&src->next, memory_order_relaxed);
+		} while(*src_p != NULL && atomic_load(&(*src_p)->last_valid) < 0);
+		return;
+	}
+
 	uintptr_t e = atomic_load_explicit(&src->table[spos], memory_order_relaxed);
 e_retry:
 	if(!entry_is_valid(e)) {
