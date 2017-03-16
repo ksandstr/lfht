@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
+#include <stdalign.h>
 #include <string.h>
 #include <errno.h>
 #include <assert.h>
@@ -111,7 +112,7 @@ int main(void)
 	diag("num_threads=%d", num_threads);
 	plan_tests(3);
 
-	struct lfht *ht = malloc(sizeof(*ht));
+	struct lfht *ht = aligned_alloc(64, sizeof(*ht));
 	lfht_init(ht, &str_hash_fn, NULL);
 	pthread_barrier_init(&start_bar, NULL, num_threads);
 	pthread_t ts[num_threads];

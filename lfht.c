@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <stdalign.h>
 #include <assert.h>
 
 #include <ccan/likely/likely.h>
@@ -101,7 +102,8 @@ static void set_bits(
 static struct lfht_table *new_table(int sizelog2)
 {
 	assert(sizelog2 >= MIN_SIZE_LOG2);
-	struct lfht_table *tab = aligned_alloc(64, sizeof(*tab));
+	struct lfht_table *tab = aligned_alloc(
+		alignof(struct lfht_table), sizeof(*tab));
 	if(tab == NULL) return NULL;
 	tab->next = NULL;
 	tab->elems = 0; tab->deleted = 0;

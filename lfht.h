@@ -8,17 +8,20 @@
 #include <stdatomic.h>
 
 
+#define CACHELINE_ALIGN __attribute__((aligned(64)))
+
+
 struct lfht_table
 {
 	/* cmpxchg-only; new value may only be NULL, or next->next. */
 	struct lfht_table *_Atomic next;
 	/* synced with something else; "eventually consistent" */
 	size_t elems, deleted;
-	/* atomic decrement only. */
+	/* monotonically decreasing */
 	_Atomic ssize_t mig_next, mig_left;
 
 	/* constants */
-	uintptr_t *table;			/* allocated separately b/c cache hazard */
+	uintptr_t *table CACHELINE_ALIGN;	/* allocated separately b/c cache hazard */
 	/* common_mask indicates bits that're the same across all keys;
 	 * common_bits specifies what those bits are. perfect_bit, when nonzero,
 	 * is always set in common_mask, and cleared in common_bits.
