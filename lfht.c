@@ -206,6 +206,14 @@ static struct lfht_table *rehash_table(
 }
 
 
+static void table_dtor(struct lfht_table *tab)
+{
+	assert(tab->elems == 0);	/* should be stable by now. */
+	free(tab->table);
+	free(tab);
+}
+
+
 static struct lfht_table *remove_table(
 	struct lfht_table *list, struct lfht_table *tab)
 {
@@ -220,9 +228,20 @@ static struct lfht_table *remove_table(
 
 	struct lfht_table *oldtab = tab,
 		*next = atomic_load_explicit(&tab->next, memory_order_relaxed);
+retry:
 	if(atomic_compare_exchange_strong(pp, &oldtab, next)) {
-		e_free(tab->table);
-		e_free(tab);
+		struct lfht_table *next2 = atomic_load(&tab->next);
+		if(unlikely(next2 != next)) {
+			/* a concurrent remove_table(..., @tab->next) altered that link
+			 * between our load and cmpxchg. repair by repeating the
+			 * operation. (next2 remains valid because of epoch reclamation.)
+			 */
+			oldtab = next;
+			next = next2;
+			/* FIXME: hit this in a test! */
+			goto retry;
+		}
+		e_call_dtor(&table_dtor, tab);
 		return next;
 	} else {
 		return oldtab;
