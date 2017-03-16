@@ -17,6 +17,8 @@
 
 #define MIN_SIZE_LOG2 5		/* 2 cachelines' worth */
 
+#define POPCOUNT(x) __builtin_popcount((x))
+
 
 static inline bool entry_is_valid(uintptr_t e) {
 	return e > LFHT_DELETED;
@@ -66,6 +68,7 @@ static void set_bits(
 	} else {
 		tab->common_mask = prev->common_mask;
 		tab->common_bits = prev->common_bits;
+		assert(POPCOUNT(prev->perfect_bit) <= 1);
 		tab->perfect_bit = prev->perfect_bit;
 
 		uintptr_t m = (uintptr_t)model;
@@ -85,6 +88,7 @@ static void set_bits(
 		|| ((uintptr_t)model & tab->common_mask) == tab->common_bits);
 	assert(tab->perfect_bit == 0
 		|| (tab->perfect_bit & tab->common_mask) != 0);
+	assert(POPCOUNT(tab->perfect_bit) <= 1);
 }
 
 
@@ -202,6 +206,7 @@ static struct lfht_table *rehash_table(
 {
 	struct lfht_table *nt = new_table(tab->size_log2);
 	if(nt == NULL) return tab;
+	set_bits(nt, tab, NULL);
 	nt->next = tab;
 	nt->gen_id = tab->gen_id + 1;
 	if(atomic_compare_exchange_strong(&ht->main, &tab, nt)) tab = nt;
@@ -293,6 +298,7 @@ static inline void *get_raw_ptr(const struct lfht_table *tab, uintptr_t e) {
 static bool ht_add(struct lfht_table *tab, const void *p, size_t hash)
 {
 	assert(((uintptr_t)p & tab->common_mask) == tab->common_bits);
+	assert(POPCOUNT(tab->perfect_bit) <= 1);
 	assert((tab->common_bits & tab->perfect_bit) == 0);
 	uintptr_t perfect = tab->perfect_bit;
 	size_t mask = (1ul << tab->size_log2) - 1, start = hash & mask;
