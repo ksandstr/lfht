@@ -54,9 +54,7 @@ static void set_bits(
 		if(model != NULL) tab->common_bits = (uintptr_t)model;
 		else {
 			/* synthesize a typical common value that the allocator is likely
-			 * to hand out. lfht_add() recognizes the case where this is
-			 * wrong, i.e. elems == 0 and common_bits conflicts with the
-			 * incoming value, and adapts.
+			 * to hand out.
 			 */
 			void *ptr = malloc(1);
 			if(ptr == NULL) tab->common_bits = (uintptr_t)tab;	/* or worse */
