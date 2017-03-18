@@ -13,7 +13,7 @@
 
 struct lfht_table
 {
-	/* cmpxchg-only; new value may only be NULL, or next->next. */
+	/* cmpxchg-only; new value may only be NULL (remove from tail). */
 	struct lfht_table *_Atomic next;
 	/* synced with something else; "eventually consistent" */
 	size_t elems, deleted;

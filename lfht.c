@@ -226,38 +226,28 @@ static void table_dtor(struct lfht_table *tab)
 }
 
 
-static struct lfht_table *remove_table(
-	struct lfht_table *list, struct lfht_table *tab)
+static void remove_table(struct lfht *ht, struct lfht_table *tab)
 {
-	struct lfht_table *_Atomic *pp = &list->next;
+	assert(tab != NULL);
+	assert(tab->next == NULL);
+
+	struct lfht_table *_Atomic *pp = &ht->main;
 	for(;;) {
-		struct lfht_table *next = atomic_load_explicit(pp,
+		struct lfht_table *prev = atomic_load_explicit(pp,
 			memory_order_relaxed);
-		if(next == NULL) return NULL;
-		if(next == tab) break;
-		pp = &next->next;
+		if(prev == tab) break;
+		if(unlikely(prev == NULL)) {
+			/* concurrent removals may happen after the split-counter series,
+			 * so let's allow this.
+			 */
+			return;
+		}
+		pp = &prev->next;
 	}
 
-	struct lfht_table *oldtab = tab,
-		*next = atomic_load_explicit(&tab->next, memory_order_relaxed);
-retry:
-	if(atomic_compare_exchange_strong(pp, &oldtab, next)) {
-		struct lfht_table *next2 = atomic_load(&tab->next);
-		if(unlikely(next2 != next)) {
-			/* a concurrent remove_table(..., @tab->next) altered that link
-			 * between our load and cmpxchg. repair by repeating the
-			 * operation. (next2 remains valid because of epoch reclamation.)
-			 */
-			oldtab = next;
-			next = next2;
-			/* FIXME: hit this in a test! */
-			goto retry;
-		}
-		e_call_dtor(&table_dtor, tab);
-		return next;
-	} else {
-		return oldtab;
-	}
+	struct lfht_table *old = atomic_exchange(pp, NULL);
+	assert(old == tab || old == NULL);
+	if(old != NULL) e_call_dtor(&table_dtor, old);
 }
 
 
@@ -369,24 +359,15 @@ static void *ht_val(
 }
 
 
-/* check the next entry in *@src_p, and migrate it if valid. */
-static void ht_migrate_entry(
-	struct lfht *ht,
-	struct lfht_table *dst,
-	struct lfht_table **src_p)
+/* check an entry in @src, migrate it to @dst (or @ht->main) if valid. returns
+ * true when @src became empty, or was already.
+ */
+static bool ht_migrate_entry(
+	struct lfht *ht, struct lfht_table *dst, struct lfht_table *src)
 {
-	struct lfht_table *src = *src_p;
-
 	ssize_t spos = atomic_fetch_sub_explicit(&src->mig_next, 1,
 		memory_order_consume);
-	if(spos < 0) {
-		/* src was already emptied. go down the list. */
-		do {
-			src = atomic_load_explicit(&src->next, memory_order_relaxed);
-		} while(src != NULL && atomic_load(&src->mig_next) < 0);
-		*src_p = src;
-		return;
-	}
+	if(spos < 0) return true;
 
 	uintptr_t e = atomic_load_explicit(&src->table[spos], memory_order_relaxed);
 e_retry:
@@ -437,32 +418,44 @@ dst_retry:
 	if(atomic_fetch_sub_explicit(&src->mig_left, 1,
 		memory_order_relaxed) == 1)
 	{
-		/* migration has completed, the table should be removed. */
+		/* migration has emptied the table. it can now be removed. */
 		assert(src->mig_next <= 0);
-		*src_p = remove_table(dst, src);
+		remove_table(ht, src);
+		return true;
+	} else {
+		/* go on. */
+		return false;
 	}
 }
 
 
 /* examine and possibly migrate one entry from a smaller secondary table into
- * @ht->main (double), or three from an equal-sized secondary table (rehash).
+ * @ht->main (double), or three from an equal-sized secondary table or if
+ * there's more than one secondary table (rehash/remask).
+ *
  * the doubling of size ensures that the secondary is emptied by the time the
  * primary fills up, and the doubling threshold's kicking in at 3/4 full means
- * a 3:1 ratio will achieve the same for rehash (if significantly ahead of
- * time).
+ * a 3:1 ratio will achieve the same for rehash/remask (though significantly
+ * ahead of time).
  */
-static void ht_migrate(struct lfht *ht, struct lfht_table *tab)
+static void ht_migrate(struct lfht *ht, struct lfht_table *dst)
 {
-	struct lfht_table *sec = atomic_load_explicit(&tab->next,
+	struct lfht_table *sec = atomic_load_explicit(&dst->next,
 		memory_order_relaxed);
-	if(sec == NULL) return;
+	if(sec == NULL) return;		/* nothing to do! */
 
-	int n_times = tab->size_log2 > sec->size_log2
-			&& atomic_load_explicit(&sec->next, memory_order_relaxed) == NULL
-		? 1 : 3;
+	bool single = true;
+	for(;;) {
+		struct lfht_table *next = atomic_load_explicit(&sec->next,
+			memory_order_relaxed);
+		if(next == NULL) break;
+		single = false;
+		sec = next;
+	}
+
+	int n_times = dst->size_log2 > sec->size_log2 && single ? 1 : 3;
 	for(int i=0; i < n_times; i++) {
-		ht_migrate_entry(ht, tab, &sec);
-		if(sec == NULL) break;
+		if(ht_migrate_entry(ht, dst, sec)) break;
 	}
 }
 
