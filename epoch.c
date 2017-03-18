@@ -1,5 +1,4 @@
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -32,7 +31,6 @@ struct e_dtor_call
 static struct e_client *_Atomic client_list = NULL;
 
 static _Atomic unsigned long global_epoch = 1;
-static volatile atomic_flag global_epoch_lock = ATOMIC_FLAG_INIT;
 
 /* [epoch + 1 mod 4] = NULL
  * [epoch     mod 4] = fresh dtors, current insert position
@@ -93,30 +91,29 @@ static struct e_client *get_client(void)
 }
 
 
+static inline unsigned long next_epoch(unsigned long e) {
+	return e != ULONG_MAX ? e + 1 : 2;
+}
+
+
 /* advance epoch & call the previously-quiet dtors. */
 static void tick(unsigned long old_epoch)
 {
-	/* get the lock or go away. */
-	if(atomic_flag_test_and_set(&global_epoch_lock)) {
-		/* true = was already locked */
-		return;
-	}
+	assert(e_inside());		/* prevent further ticks */
 
 	/* bump the epoch number. */
-	unsigned long new_epoch = old_epoch + 1;
-	if(old_epoch == ULONG_MAX) new_epoch = 2;
-	if(!atomic_compare_exchange_strong(&global_epoch,
-		&old_epoch, new_epoch))
+	unsigned long new_epoch = next_epoch(old_epoch);
+	if(!atomic_compare_exchange_weak_explicit(&global_epoch,
+		&old_epoch, new_epoch, memory_order_release, memory_order_relaxed))
 	{
-		/* nuh-uh! */
-		atomic_flag_clear_explicit(&global_epoch_lock, memory_order_release);
+		/* we're not the ones that ticked it forward. */
+		assert(old_epoch == new_epoch);
 		return;
 	}
 
 	struct e_dtor_call *dead = atomic_exchange_explicit(
 		&epoch_dtors[(old_epoch - 2) & 3], NULL,
 		memory_order_relaxed);
-	atomic_flag_clear_explicit(&global_epoch_lock, memory_order_release);
 
 	/* call the list in push order, i.e. reverse it first. */
 	struct e_dtor_call *head = NULL;
@@ -144,7 +141,10 @@ static void maybe_tick(unsigned long epoch, struct e_client *self)
 	while(c != NULL) {
 		unsigned long c_epoch = atomic_load_explicit(&c->epoch,
 			memory_order_relaxed);
-		if(c_epoch > 0 && c != self) quiet = false;
+		if(c != self && c_epoch > 0 && c_epoch < epoch) {
+			quiet = false;
+			break;
+		}
 		c = atomic_load_explicit(&c->next, memory_order_consume);
 	}
 	if(quiet) tick(epoch);
@@ -176,6 +176,7 @@ void e_end(int cookie)
 		count = atomic_load_explicit(&epoch_counts[epoch & 3],
 			memory_order_relaxed) + atomic_load_explicit(
 				&epoch_counts[(epoch - 1) & 3], memory_order_relaxed);
+	assert(epoch == c->epoch || epoch == next_epoch(c->epoch));
 	/* FIXME: come up with some other policy for making the clock tick. it's
 	 * worthwhile for avoiding a loop through every client.
 	 */
