@@ -1,4 +1,5 @@
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -13,9 +14,8 @@ struct e_client
 {
 	/* concurrent access per item w/ stdatomic. */
 	struct e_client *_Atomic next;
-	_Atomic unsigned long epoch;	/* 0 for outside. */
+	_Atomic unsigned long epoch;	/* 0 for idle. */
 
-	/* constants after ctor */
 	bool initialized;
 };
 
@@ -30,7 +30,7 @@ struct e_dtor_call
 
 static struct e_client *_Atomic client_list = NULL;
 
-static _Atomic unsigned long global_epoch = 1;
+static _Atomic unsigned long global_epoch = 2;
 
 /* [epoch + 1 mod 4] = NULL
  * [epoch     mod 4] = fresh dtors, current insert position
@@ -47,24 +47,58 @@ static _Atomic unsigned long epoch_counts[4];
 
 static void client_dtor(void *clientptr)
 {
-	/* delink from client_list */
-	struct e_client *c = clientptr, *prev,
-		*_Atomic *pp = &client_list;
-	do {
-		prev = atomic_load_explicit(pp, memory_order_relaxed);
-		if(prev == c) break;
-		pp = &prev->next;
-	} while(prev != NULL);
+	struct e_client *c = clientptr;
 
-	struct e_client *old = c;
-	if(!atomic_compare_exchange_strong(pp, &old, c->next)) {
-		/* bah! concurrent client exit happened. redo from start. */
-		client_dtor(clientptr);
-		return;
+	/* find parent pointer. */
+	struct e_client *_Atomic *pp = &client_list;
+	for(;;) {
+		struct e_client *prev = atomic_load_explicit(pp, memory_order_relaxed);
+		if(prev == c) break;
+		if(prev == NULL) {
+			/* the list will never not have items that should be there. */
+			fprintf(stderr, "epoch: %s: shouldn't happen!\n", __func__);
+			abort();
+		}
+		pp = &prev->next;
 	}
 
-	/* dispose safely. */
-	e_free(c);
+	/* basic list removal. we can exchange instead of cmpxchg because it's
+	 * known that only the thread in client_dtor(@clientptr) will write the
+	 * ->next == @clientptr.
+	 */
+	struct e_client *next = atomic_load_explicit(
+			&c->next, memory_order_relaxed),
+		*old = atomic_exchange(pp, next);
+	assert(old == c);
+
+	/* however, there's some fixups that gotta get perfermt. for one, c->next
+	 * may have changed, so we might have written the wrong thing. this'd keep
+	 * it visible past death, which is bad. the fix is iterative.
+	 */
+	struct e_client *next2;
+	while(next != (next2 = atomic_load(&c->next))) {
+		struct e_client *old2 = atomic_exchange(pp, next2);
+		assert(old2 != c);
+		next = next2;
+	}
+
+	/* the other fixup is for the parent having removed itself, making `pp'
+	 * unreachable through the list, thereby making our exchange entirely
+	 * ineffective. the fix is leaving the dead `pp' lie and starting over.
+	 */
+	if(pp != &client_list) {
+		bool found = false;
+		for(struct e_client *cur = atomic_load(&client_list);
+			cur != NULL;
+			cur = atomic_load(&cur->next))
+		{
+			if(pp == &cur->next) {
+				found = true;
+				break;
+			}
+		}
+		if(!found) client_dtor(clientptr);
+	}
 }
 
 
@@ -72,9 +106,13 @@ static void client_ctor(struct e_client *c)
 {
 	assert(!c->initialized);
 	c->initialized = true;
-	do {
-		c->next = atomic_load_explicit(&client_list, memory_order_relaxed);
-	} while(!atomic_compare_exchange_weak(&client_list, &c->next, c));
+	assert(c->epoch == 0);
+	c->next = atomic_load_explicit(&client_list, memory_order_relaxed);
+	while(!atomic_compare_exchange_strong_explicit(&client_list,
+		&c->next, c, memory_order_release, memory_order_relaxed))
+	{
+		/* spin */
+	}
 }
 
 
