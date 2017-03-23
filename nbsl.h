@@ -58,8 +58,28 @@ extern struct nbsl_node *nbsl_top(struct nbsl *list);
  */
 extern bool nbsl_del(struct nbsl *list, struct nbsl_node *n);
 
-extern struct nbsl_node *nbsl_first(const struct nbsl *list);
-extern struct nbsl_node *nbsl_next(const struct nbsl_node *node);
 
+struct nbsl_iter {
+	struct nbsl_node *prev, *cur;
+};
+
+/* iteration. this is always read-only, i.e. never causes writes to any node
+ * along the chain. it skips over dead nodes, but the ones it returns may
+ * appear dead nonetheless due to concurrent delete.
+ */
+extern struct nbsl_node *nbsl_first(
+	const struct nbsl *list, struct nbsl_iter *it);
+extern struct nbsl_node *nbsl_next(
+	const struct nbsl *list, struct nbsl_iter *it);
+
+/* attempt to remove value returned from previous call to nbsl_{first,next}(),
+ * returning true on success and false on failure. @it remains robust against
+ * concurrent mutation; subsequent calls to nbsl_del_at() before nbsl_next()
+ * always return false.
+ *
+ * a sequence of nbsl_del_at() and nbsl_next() can be used to pop all nodes
+ * from @list from a certain point onward.
+ */
+extern bool nbsl_del_at(const struct nbsl *list, struct nbsl_iter *it);
 
 #endif

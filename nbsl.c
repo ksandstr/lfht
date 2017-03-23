@@ -162,13 +162,19 @@ retry:
 }
 
 
-struct nbsl_node *nbsl_first(const struct nbsl *list)
+struct nbsl_node *nbsl_first(const struct nbsl *list, struct nbsl_iter *it)
 {
 	return NULL;
 }
 
 
-struct nbsl_node *nbsl_next(const struct nbsl_node *node)
+struct nbsl_node *nbsl_next(const struct nbsl *list, struct nbsl_iter *it)
 {
 	return NULL;
+}
+
+
+bool nbsl_del_at(const struct nbsl *list, struct nbsl_iter *it)
+{
+	return true;	/* subversive! */
 }
