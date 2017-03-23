@@ -162,15 +162,36 @@ retry:
 }
 
 
+static struct nbsl_node *skip_dead_nodes(struct nbsl_iter *it)
+{
+	while(it->cur != NULL) {
+		uintptr_t next = atomic_load_explicit(&it->cur->next,
+			memory_order_relaxed);
+		if((next & (F_RESERVED | F_DEAD)) == 0) break;
+		else {
+			/* it->prev remains as before. */
+			it->cur = n_ptr(next);
+		}
+	}
+	return it->cur;
+}
+
+
 struct nbsl_node *nbsl_first(const struct nbsl *list, struct nbsl_iter *it)
 {
-	return NULL;
+	it->prev = NULL;
+	it->cur = n_ptr(atomic_load_explicit(&list->n.next,
+		memory_order_consume));
+	return skip_dead_nodes(it);
 }
 
 
 struct nbsl_node *nbsl_next(const struct nbsl *list, struct nbsl_iter *it)
 {
-	return NULL;
+	it->prev = it->cur;
+	it->cur = n_ptr(atomic_load_explicit(&it->prev->next,
+		memory_order_relaxed));
+	return skip_dead_nodes(it);
 }
 
 

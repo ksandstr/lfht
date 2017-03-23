@@ -131,7 +131,6 @@ static void *p20_d15_with_iters_fn(void *param_ptr)
 			ret->all_lost = false;
 		}
 	}
-	diag("thread_id=%d completed", thread_id);
 
 	return ret;
 }
@@ -195,10 +194,8 @@ int main(void)
 		all_found = all_found & rs[i]->all_found;
 		all_lost = all_lost & rs[i]->all_lost;
 	}
-	todo_start("these two are broken");
 	ok1(all_found);
 	ok1(all_lost);
-	todo_end();
 
 	/* totals should add up */
 	size_t total = remain.size;
