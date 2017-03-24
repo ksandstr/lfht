@@ -80,6 +80,6 @@ extern struct nbsl_node *nbsl_next(
  * a sequence of nbsl_del_at() and nbsl_next() can be used to pop all nodes
  * from @list from a certain point onward.
  */
-extern bool nbsl_del_at(const struct nbsl *list, struct nbsl_iter *it);
+extern bool nbsl_del_at(struct nbsl *list, struct nbsl_iter *it);
 
 #endif

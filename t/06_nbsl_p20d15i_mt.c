@@ -193,7 +193,6 @@ int main(void)
 	}
 
 	/* analyze 'em. */
-	todo_start("not implemented");
 	darray(struct item *) remain = darray_new();
 	for(;;) {
 		struct item *it = pop(list);

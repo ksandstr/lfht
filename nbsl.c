@@ -195,7 +195,22 @@ struct nbsl_node *nbsl_next(const struct nbsl *list, struct nbsl_iter *it)
 }
 
 
-bool nbsl_del_at(const struct nbsl *list, struct nbsl_iter *it)
+bool nbsl_del_at(struct nbsl *list, struct nbsl_iter *it)
 {
-	return true;	/* subversive! */
+	if(it->cur == NULL) return false;	/* edge case: cursor at end. */
+
+	_Atomic uintptr_t *pp = it->prev == NULL ? &list->n.next : &it->prev->next;
+	uintptr_t headptr = atomic_load_explicit(pp, memory_order_consume);
+
+	uintptr_t nextptr = atomic_load_explicit(&it->cur->next,
+		memory_order_relaxed);
+	if((nextptr & F_DEAD) != 0) return false;
+
+	bool got = del_mark(it->cur, &nextptr);
+	if(!got && (nextptr & F_DEAD) != 0) return false;
+	if((headptr & F_MASK) == 0 && n_ptr(headptr) == it->cur) {
+		del_complete(pp, headptr, it->cur, nextptr);
+	}
+
+	return got;
 }
