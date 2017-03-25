@@ -7,110 +7,144 @@
 #include "nbsl.h"
 
 
-#define F_RESERVED 1
-#define F_DEAD 2
-#define F_MASK ((uintptr_t)3)
+#define F_MARK 1	/* dead */
+#define F_FLAG 2	/* next is about to die */
+#define F__MASK ((uintptr_t)3)
 
 
 static inline struct nbsl_node *n_ptr(uintptr_t x) {
-	return (struct nbsl_node *)(x & ~F_MASK);
+	return (struct nbsl_node *)(x & ~F__MASK);
+}
+
+
+/* idempotently set flag on *@pp, passing through backlinks as necessary.
+ * @p_val is set to a value of (*@pp)->next. *@pp is updated to the node that
+ * points to @n, which may be the list head, or NULL if @n isn't on the list
+ * anymore. returns true if *@pp points to @n and this flagged it, false
+ * otherwise.
+ */
+static bool try_flag(
+	struct nbsl_node **pp, uintptr_t p_val,
+	struct nbsl_node *n)
+{
+	struct nbsl_node *p = *pp;
+	const uintptr_t new_val = (uintptr_t)n | F_FLAG;
+
+	bool got;
+	for(;;) {
+		if(p_val == new_val) { *pp = p; return false; }
+
+		uintptr_t old_val = (uintptr_t)n;
+		got = atomic_compare_exchange_strong(&p->next, &old_val, new_val);
+		if(got || old_val == new_val) {
+			/* success, or concurrent flagging. */
+			*pp = p;
+			return got;
+		}
+
+		p_val = old_val;
+
+		/* failure due to concurrent marking. follow backlinks. */
+		while((p_val & F_MARK) != 0) {
+			p = atomic_load_explicit(&p->backlink, memory_order_relaxed);
+			assert(p != NULL);
+			p_val = atomic_load_explicit(&p->next, memory_order_relaxed);
+		}
+
+		/* @p is no longer @n's parent. walk forward until the parent is
+		 * found, or return NULL.
+		 */
+		assert(n_ptr(p_val) != NULL);
+		while(n_ptr(p_val) != n) {
+			p = n_ptr(p_val);
+			p_val = atomic_load_explicit(&p->next, memory_order_relaxed);
+			if(n_ptr(p_val) == NULL) { *pp = NULL; return false; }
+		}
+	}
+
+	*pp = p;
+	return got;
+}
+
+
+/* complete removal of @prev -> @n, where @nextval == @n->next. */
+static inline void rend_the_marked(
+	struct nbsl_node *prev, struct nbsl_node *n, uintptr_t nextval)
+{
+	assert((nextval & F_MARK) != 0);
+	assert((nextval & F_FLAG) == 0);
+	uintptr_t prevval = (uintptr_t)n | F_FLAG;
+	atomic_compare_exchange_strong_explicit(&prev->next,
+		&prevval, nextval & ~F__MASK,
+		memory_order_release, memory_order_relaxed);
+}
+
+
+/* complete removal of @n from flagged parent @prev. */
+static void clear_flag(struct nbsl_node *prev, struct nbsl_node *n)
+{
+	atomic_exchange_explicit(&n->backlink, prev, memory_order_release);
+
+	/* set mark idempotently, load fresh @n->next. */
+	uintptr_t nextval = atomic_load_explicit(&n->next, memory_order_relaxed);
+	while((nextval & F_MARK) == 0) {
+		while((nextval & F_FLAG) != 0) {
+			clear_flag(n, n_ptr(nextval));
+			nextval = atomic_load(&n->next);
+		}
+		if(atomic_compare_exchange_strong_explicit(
+			&n->next, &nextval, nextval | F_MARK,
+			memory_order_release, memory_order_relaxed))
+		{
+			nextval |= F_MARK;
+		}
+	}
+
+	rend_the_marked(prev, n, nextval);
 }
 
 
 bool nbsl_push(struct nbsl *list, struct nbsl_node *top, struct nbsl_node *n)
 {
-	assert(((uintptr_t)n & F_MASK) == 0);
-	uintptr_t old = atomic_load_explicit(&list->n.next, memory_order_relaxed);
-	assert((old & F_MASK) == 0);
+	assert(((uintptr_t)n & F__MASK) == 0);
+	uintptr_t old = atomic_load_explicit(&list->n.next, memory_order_consume);
+	while((old & F_FLAG) != 0) {
+		clear_flag(&list->n, n_ptr(old));
+		old = atomic_load(&list->n.next);
+	}
+	assert((old & F_MARK) == 0);
 	n->next = old;
+	n->backlink = NULL;
 	return n_ptr(old) == top
 		&& atomic_compare_exchange_strong_explicit(&list->n.next,
 			&old, (uintptr_t)n, memory_order_release, memory_order_relaxed);
 }
 
 
-/* mark @n per nbsl_del() protocol. *@nextptr is a value of @n->next, reloaded
- * if the cmpxchg fails. returns true when we set F_RESERVED on @n, and false
- * when @n->next == 0 or another thread already set F_RESERVED or F_DEAD.
- */
-static inline bool del_mark(struct nbsl_node *n, uintptr_t *nextptr)
-{
-	assert((*nextptr & F_DEAD) == 0);
-	while((*nextptr & F_MASK) == 0) {
-		if(atomic_compare_exchange_strong(&n->next,
-			nextptr, *nextptr | F_RESERVED))
-		{
-			*nextptr |= F_RESERVED;
-			return true;
-		}
-	}
-	return false;
-}
-
-
-static inline void del_complete(
-	_Atomic uintptr_t *pp, uintptr_t headptr,
-	struct nbsl_node *n, uintptr_t nextptr)
-{
-	assert(n_ptr(headptr) == n);
-	assert((headptr & F_RESERVED) == 0);
-	assert((headptr & F_DEAD) == 0);
-	/* @nextptr must be value of earlier atomic_load(&n->next). */
-	assert((nextptr & F_MASK) == F_RESERVED);
-
-	/* remove @n from @pp. clean bits if removal was successful, i.e. not
-	 * broken by a concurrent insert or completed by another thread.
-	 */
-	if(atomic_compare_exchange_strong(pp, &headptr, nextptr & ~F_MASK)
-		|| (headptr & ~F_MASK) == (nextptr & ~F_MASK))
-	{
-		/* change R -> D and ignore the result, per nbsl_del() protocol. */
-		atomic_compare_exchange_strong(&n->next,
-			&nextptr, (nextptr & ~F_RESERVED) | F_DEAD);
-		assert((atomic_load(&n->next) & F_MASK) == F_DEAD);
-	}
-}
-
-
-/* remove @n, which was at @list head, where @list->n.next was @headptr.
- * return true iff @n wasn't removed already, and this thread was the one to
- * mark @n for removal.
- */
-static bool take_head(
-	struct nbsl *list, uintptr_t headptr, struct nbsl_node *n)
-{
-	uintptr_t nextptr = atomic_load_explicit(&n->next, memory_order_consume);
-	if((nextptr & F_DEAD) != 0) {
-		/* move the next item over where possible & signal failure to
-		 * grab @n.
-		 */
-		atomic_compare_exchange_strong(&list->n.next, &headptr,
-			nextptr & ~F_MASK);
-		return false;
-	}
-
-	/* try to mark it per nbsl_del() protocol. */
-	bool got = del_mark(n, &nextptr);
-	if(!got && (nextptr & F_DEAD) != 0) return false;
-
-	/* ensure that removal completed. */
-	assert((nextptr & F_RESERVED) != 0);
-	del_complete(&list->n.next, headptr, n, nextptr);
-
-	return got;
-}
-
-
 struct nbsl_node *nbsl_pop(struct nbsl *list)
 {
-	uintptr_t headptr;
-retry:
-	headptr = atomic_load_explicit(&list->n.next, memory_order_consume);
-	if(headptr == 0) return NULL;
-	assert((headptr & F_MASK) == 0);
+	struct nbsl_node *p = &list->n;
+	uintptr_t p_val = atomic_load(&p->next);
+	assert((p_val & F_MARK) == 0);
+	struct nbsl_node *n = n_ptr(p_val);
 
-	struct nbsl_node *n = n_ptr(headptr);
-	if(!take_head(list, headptr, n)) goto retry;
+	/* find the first n: p -> n where ¬p.flag ∧ ¬p.mark, and atomically set
+	 * p.flag .
+	 */
+	while(n != NULL) {
+		if((p_val & F__MASK) != 0) {
+			p = n;
+			p_val = atomic_load(&p->next);
+		} else if(atomic_compare_exchange_strong(&p->next,
+			&p_val, p_val | F_FLAG))
+		{
+			break;
+		}
+		n = n_ptr(p_val);
+	}
+	if(n == NULL) return NULL;
+
+	clear_flag(p, n);
 	return n;
 }
 
@@ -122,42 +156,31 @@ struct nbsl_node *nbsl_top(struct nbsl *list) {
 
 bool nbsl_del(struct nbsl *list, struct nbsl_node *target)
 {
-	uintptr_t headptr;
-retry:
-	headptr = atomic_load_explicit(&list->n.next, memory_order_consume);
-	if(headptr == 0) return false;
-	struct nbsl_node *p = n_ptr(headptr);
-	if(p == target) return take_head(list, headptr, p);
-
-	/* find P -> X. */
+	/* find p -> n, where n == target. */
+	struct nbsl_node *p = &list->n, *n = NULL;
 	uintptr_t p_val = atomic_load(&p->next), n_val;
-	struct nbsl_node *n;
-	while(p_val != 0) {
+	while(n_ptr(p_val) != NULL) {
 		n = n_ptr(p_val);
 		n_val = atomic_load(&n->next);
-		if(n == target) break;
-		if((p_val & (F_RESERVED | F_DEAD)) == 0
-			&& (n_val & F_RESERVED) != 0)
-		{
-			/* complete an in-progress deletion and repeat. */
-			del_complete(&p->next, p_val, n, n_val);
+
+		if((n_val & F_MARK) != 0 && (p_val & F_FLAG) != 0) {
+			/* complete an in-progress deletion. */
+			rend_the_marked(p, n, n_val);
+			if(n == target) return false;
 			p_val = atomic_load(&p->next);
+		} else if(n == target) {
+			/* got it */
+			break;
 		} else {
 			p = n;
 			p_val = n_val;
 		}
 	}
-	if(p_val == 0) return false;
-	if((p_val & F_DEAD) != 0) goto retry;
+	if(n_ptr(p_val) == NULL) return false;
 
-	/* try to mark, try to delete if permitted. */
-	bool got = del_mark(n, &n_val);
-	if(!got && (n_val & F_DEAD) != 0) return false;
-	if((p_val & F_RESERVED) == 0) {
-		assert((n_val & F_RESERVED) != 0);
-		del_complete(&p->next, p_val, n, n_val);
-	}
-
+	/* flag and delete. */
+	bool got = try_flag(&p, p_val, n);
+	if(p != NULL) clear_flag(p, n);
 	return got;
 }
 
@@ -167,7 +190,7 @@ static struct nbsl_node *skip_dead_nodes(struct nbsl_iter *it)
 	while(it->cur != NULL) {
 		uintptr_t next = atomic_load_explicit(&it->cur->next,
 			memory_order_relaxed);
-		if((next & (F_RESERVED | F_DEAD)) == 0) break;
+		if((next & F_MARK) == 0) break;
 		else {
 			/* it->prev remains as before. */
 			it->cur = n_ptr(next);
@@ -177,16 +200,16 @@ static struct nbsl_node *skip_dead_nodes(struct nbsl_iter *it)
 }
 
 
-struct nbsl_node *nbsl_first(const struct nbsl *list, struct nbsl_iter *it)
+struct nbsl_node *nbsl_first(struct nbsl *list, struct nbsl_iter *it)
 {
-	it->prev = NULL;
+	it->prev = &list->n;
 	it->cur = n_ptr(atomic_load_explicit(&list->n.next,
 		memory_order_consume));
 	return skip_dead_nodes(it);
 }
 
 
-struct nbsl_node *nbsl_next(const struct nbsl *list, struct nbsl_iter *it)
+struct nbsl_node *nbsl_next(struct nbsl *list, struct nbsl_iter *it)
 {
 	it->prev = it->cur;
 	it->cur = n_ptr(atomic_load_explicit(&it->prev->next,
@@ -198,19 +221,16 @@ struct nbsl_node *nbsl_next(const struct nbsl *list, struct nbsl_iter *it)
 bool nbsl_del_at(struct nbsl *list, struct nbsl_iter *it)
 {
 	if(it->cur == NULL) return false;	/* edge case: cursor at end. */
+	if(it->prev == NULL) return false;	/* repeat case: always NULL */
 
-	_Atomic uintptr_t *pp = it->prev == NULL ? &list->n.next : &it->prev->next;
-	uintptr_t headptr = atomic_load_explicit(pp, memory_order_consume);
-
-	uintptr_t nextptr = atomic_load_explicit(&it->cur->next,
+	uintptr_t cur_val = atomic_load_explicit(&it->cur->next,
 		memory_order_relaxed);
-	if((nextptr & F_DEAD) != 0) return false;
+	if((cur_val & F_MARK) != 0) return false;	/* already gone */
 
-	bool got = del_mark(it->cur, &nextptr);
-	if(!got && (nextptr & F_DEAD) != 0) return false;
-	if((headptr & F_MASK) == 0 && n_ptr(headptr) == it->cur) {
-		del_complete(pp, headptr, it->cur, nextptr);
-	}
-
+	struct nbsl_node *p = it->prev;
+	uintptr_t p_val = atomic_load_explicit(&p->next, memory_order_consume);
+	bool got = try_flag(&p, p_val, it->cur);
+	it->prev = NULL;
+	if(p != NULL) clear_flag(p, it->cur);
 	return got;
 }

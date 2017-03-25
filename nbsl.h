@@ -15,10 +15,12 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include <stdlib.h>
 
 
 struct nbsl_node {
 	_Atomic uintptr_t next;
+	struct nbsl_node *_Atomic backlink;
 } __attribute__((aligned(8)));
 
 
@@ -27,12 +29,12 @@ struct nbsl {
 };
 
 
-#define NBSL_LIST_INIT(name) { { .next = 0 } }
+#define NBSL_LIST_INIT(name) { { .next = 0, .backlink = NULL } }
 
 
-static inline void nbsl_init(struct nbsl *list)
-{
-	atomic_store_explicit(&list->n.next, 0, memory_order_release);
+static inline void nbsl_init(struct nbsl *list) {
+	struct nbsl proto = NBSL_LIST_INIT(proto);
+	*list = proto;
 }
 
 
@@ -67,10 +69,8 @@ struct nbsl_iter {
  * along the chain. it skips over dead nodes, but the ones it returns may
  * appear dead nonetheless due to concurrent delete.
  */
-extern struct nbsl_node *nbsl_first(
-	const struct nbsl *list, struct nbsl_iter *it);
-extern struct nbsl_node *nbsl_next(
-	const struct nbsl *list, struct nbsl_iter *it);
+extern struct nbsl_node *nbsl_first(struct nbsl *list, struct nbsl_iter *it);
+extern struct nbsl_node *nbsl_next(struct nbsl *list, struct nbsl_iter *it);
 
 /* attempt to remove value returned from previous call to nbsl_{first,next}(),
  * returning true on success and false on failure. @it remains robust against
