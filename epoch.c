@@ -93,19 +93,16 @@ static void tick(unsigned long old_epoch)
 {
 	assert(e_inside());		/* prevent further ticks */
 
-	/* bump the epoch number. */
-	unsigned long new_epoch = next_epoch(old_epoch);
-	if(!atomic_compare_exchange_weak_explicit(&global_epoch,
-		&old_epoch, new_epoch, memory_order_release, memory_order_relaxed))
-	{
-		/* we're not the ones that ticked it forward. */
-		assert(old_epoch == new_epoch);
-		return;
-	}
+	/* bump the epoch number, caring nothing for the result. */
+	unsigned long oldval = old_epoch, new_epoch = next_epoch(old_epoch);
+	atomic_compare_exchange_strong_explicit(&global_epoch,
+		&oldval, new_epoch, memory_order_release, memory_order_relaxed);
 
+	/* once-only is guaranteed by atomic exchange. */
 	struct e_dtor_call *dead = atomic_exchange_explicit(
 		&epoch_dtors[(old_epoch - 2) & 3], NULL,
-		memory_order_relaxed);
+		memory_order_consume);
+	if(dead == NULL) return;
 
 	/* call the list in push order, i.e. reverse it first. */
 	struct e_dtor_call *head = NULL;
@@ -201,7 +198,7 @@ void _e_call_dtor(void (*dtor_fn)(void *ptr), void *ptr)
 	struct e_dtor_call *_Atomic *head = &epoch_dtors[epoch & 3];
 	do {
 		call->next = atomic_load_explicit(head, memory_order_relaxed);
-	} while(!atomic_compare_exchange_strong(head, &call->next, call));
+	} while(!atomic_compare_exchange_weak(head, &call->next, call));
 	atomic_fetch_add_explicit(&epoch_counts[epoch & 3], 1,
 		memory_order_release);
 }
