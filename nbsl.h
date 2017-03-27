@@ -50,7 +50,7 @@ extern bool nbsl_push(
 extern struct nbsl_node *nbsl_pop(struct nbsl *list);
 
 /* peek first node in @list, returning it or NULL. */
-extern struct nbsl_node *nbsl_top(struct nbsl *list);
+extern struct nbsl_node *nbsl_top(const struct nbsl *list);
 
 /* remove @n from @list. O(n).
  *
@@ -71,8 +71,10 @@ struct nbsl_iter {
  * along the chain. it skips over dead nodes, but the ones it returns may
  * appear dead nonetheless due to concurrent delete.
  */
-extern struct nbsl_node *nbsl_first(struct nbsl *list, struct nbsl_iter *it);
-extern struct nbsl_node *nbsl_next(struct nbsl *list, struct nbsl_iter *it);
+extern struct nbsl_node *nbsl_first(
+	const struct nbsl *list, struct nbsl_iter *it);
+extern struct nbsl_node *nbsl_next(
+	const struct nbsl *list, struct nbsl_iter *it);
 
 /* attempt to remove value returned from previous call to nbsl_{first,next}(),
  * returning true on success and false on failure. @it remains robust against
