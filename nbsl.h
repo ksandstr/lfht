@@ -1,12 +1,14 @@
 
-/* non-blocking singly-linked lists. insert supported at the top ("push"),
- * deletion at any point. the intrusive link structure ("nbsl_node") must be
- * aligned to 8; due to pointer fuckery, structures pointed to solely with
- * this mechanism might not show up as reachable in valgrind etc.
+/* non-blocking singly-linked lists.
  *
- * pointer lifetime safety left up to caller. code should expect to see
- * not-quite-deleted nodes during iteration in use cases that run concurrently
- * with nbsl_pop() or nbsl_del().
+ * the algorithm used was presented by Fomitchev and Ruppert in ``Lock-Free
+ * Linked Lists and Skip Lists'' [York University, 2003].
+ *
+ * this implementation supports insert at the list head ("push"), deletion at
+ * any point, and iteration. the intrusive link structure ("nbsl_node") must
+ * be aligned to 4; due to storage of metadata in the low bits, structures
+ * pointed to solely with this mechanism might not show up as reachable in
+ * valgrind etc.
  */
 
 #ifndef NBSL_H
@@ -21,7 +23,7 @@
 struct nbsl_node {
 	_Atomic uintptr_t next;
 	struct nbsl_node *_Atomic backlink;
-} __attribute__((aligned(8)));
+} __attribute__((aligned(4)));
 
 
 struct nbsl {
