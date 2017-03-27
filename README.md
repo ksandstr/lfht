@@ -3,15 +3,15 @@ What
 ====
 
 This directory contains an implementation of a lock-free wait-free
-singly-linked lists (`nbsl'), a lock-free hashtable (`lfht'), an epoch
-reclamation mechanism, and their respective tests.
+singly-linked lists ("nbsl"), a lock-free hashtable ("lfht"), an epoch
+reclamation mechanism, and some tests for each.
 
 Licensed under the GNU GPL v3-or-later, found in the COPYING file in this
 directory.
 
 
 !! Warning !! Danger !! Warning !!
-==================================
+----------------------------------
 
 These data structures are not proven to work. Lock-free and wait-free
 algorithms, as well as any application using them, are fraught with subtle
@@ -20,7 +20,7 @@ at their own risk. Caveat lector to the max: this'll bite your dog's dick off.
 
 
 Design
-======
+------
 
 `lfht` is based on a design someone discussed on Reddit a few years ago in the
 context of real-time data structures. Fundamentally the idea is simple: when a
@@ -44,7 +44,7 @@ equivalent to wait-freeness even if it's a weaker qualification.
 
 
 Interface
-=========
+---------
 
 `lfht` implements a lock-free hashed intrusive multiset. Callers are required
 to be in an open epoch bracket during calls to `lfht_*()` functions, and while
@@ -65,7 +65,7 @@ hazard pointers) should also work.
 
 
 Performance
-===========
+-----------
 
 Completely unmeasured.
 
