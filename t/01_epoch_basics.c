@@ -14,7 +14,7 @@
 
 int main(void)
 {
-	plan_tests(10);
+	plan_tests(5);
 
 	ok1(!e_inside());
 	int eck = e_begin();
@@ -23,20 +23,6 @@ int main(void)
 	e_end(eck);
 	pass("e_end() didn't panic");
 	ok1(!e_inside());
-
-	eck = e_begin();
-	assert(eck >= 0);
-	int tck = e_torpor();
-	ok1(tck >= 0);
-	ok1(e_inside());
-	int n = e_rouse(tck);
-	ok(n == 0 || n == -EAGAIN,
-		"e_rouse() on valid cookie ok");
-	e_end(eck);
-	ok1(!e_inside());
-
-	tck = e_torpor();
-	ok(tck == -EINVAL, "e_torpor() invalid outside e_begin()");
 
 	return exit_status();
 }

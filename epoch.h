@@ -19,16 +19,6 @@
 extern int e_begin(void);
 extern void e_end(int cookie);
 
-/* to sleep in an epoch bracket without delaying memory reclamation, a thread
- * may enter a "break permitted" period and check its status afterward. if the
- * thread's epoch bracket was interrupted, it should immediately break out
- * into the outermost e_end() and restart. epoch-protected pointers will be
- * invalid during the period, only becoming valid again if the status check
- * didn't indicate restart.
- */
-extern int e_torpor(void);				/* returns a cookie, or -EINVAL */
-extern int e_rouse(int torpor_cookie);	/* 0 for ok, -EAGAIN for restart */
-
 /* library code may assert() this, or against it to mark a definite restart
  * point.
  */

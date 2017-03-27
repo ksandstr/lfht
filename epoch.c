@@ -181,19 +181,6 @@ void e_end(int cookie)
 }
 
 
-int e_torpor(void)
-{
-	if(!e_inside()) return -EINVAL;
-	return 2;
-}
-
-
-int e_rouse(int cookie)
-{
-	return 0;
-}
-
-
 bool e_inside(void)
 {
 	struct e_client *c = get_client();
