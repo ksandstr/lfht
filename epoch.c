@@ -7,13 +7,15 @@
 #include <assert.h>
 #include <errno.h>
 
+#include <ccan/container_of/container_of.h>
+
+#include "nbsl.h"
 #include "epoch.h"
 
 
 struct e_client
 {
-	/* concurrent access per item w/ stdatomic. */
-	struct e_client *_Atomic next;
+	struct nbsl_node link;
 	_Atomic unsigned long epoch;	/* 0 for idle. */
 
 	bool initialized;
@@ -28,7 +30,7 @@ struct e_dtor_call
 };
 
 
-static struct e_client *_Atomic client_list = NULL;
+static struct nbsl client_list = NBSL_LIST_INIT(client_list);
 
 static _Atomic unsigned long global_epoch = 2;
 
@@ -48,56 +50,10 @@ static _Atomic unsigned long epoch_counts[4];
 static void client_dtor(void *clientptr)
 {
 	struct e_client *c = clientptr;
-
-	/* find parent pointer. */
-	struct e_client *_Atomic *pp = &client_list;
-	for(;;) {
-		struct e_client *prev = atomic_load_explicit(pp, memory_order_relaxed);
-		if(prev == c) break;
-		if(prev == NULL) {
-			/* the list will never not have items that should be there. */
-			fprintf(stderr, "epoch: %s: shouldn't happen!\n", __func__);
-			abort();
-		}
-		pp = &prev->next;
-	}
-
-	/* basic list removal. we can exchange instead of cmpxchg because it's
-	 * known that only the thread in client_dtor(@clientptr) will write the
-	 * ->next == @clientptr.
-	 */
-	struct e_client *next = atomic_load_explicit(
-			&c->next, memory_order_relaxed),
-		*old = atomic_exchange(pp, next);
-	assert(old == c);
-
-	/* however, there's some fixups that gotta get perfermt. for one, c->next
-	 * may have changed, so we might have written the wrong thing. this'd keep
-	 * it visible past death, which is bad. the fix is iterative.
-	 */
-	struct e_client *next2;
-	while(next != (next2 = atomic_load(&c->next))) {
-		struct e_client *old2 = atomic_exchange(pp, next2);
-		assert(old2 != c);
-		next = next2;
-	}
-
-	/* the other fixup is for the parent having removed itself, making `pp'
-	 * unreachable through the list, thereby making our exchange entirely
-	 * ineffective. the fix is leaving the dead `pp' lie and starting over.
-	 */
-	if(pp != &client_list) {
-		bool found = false;
-		for(struct e_client *cur = atomic_load(&client_list);
-			cur != NULL;
-			cur = atomic_load(&cur->next))
-		{
-			if(pp == &cur->next) {
-				found = true;
-				break;
-			}
-		}
-		if(!found) client_dtor(clientptr);
+	bool ok = nbsl_del(&client_list, &c->link);
+	if(!ok) {
+		fprintf(stderr, "epoch: %s: didn't delete c=%p??\n", __func__, c);
+		abort();
 	}
 }
 
@@ -107,10 +63,8 @@ static void client_ctor(struct e_client *c)
 	assert(!c->initialized);
 	c->initialized = true;
 	assert(c->epoch == 0);
-	c->next = atomic_load_explicit(&client_list, memory_order_relaxed);
-	while(!atomic_compare_exchange_strong_explicit(&client_list,
-		&c->next, c, memory_order_release, memory_order_relaxed))
-	{
+
+	while(!nbsl_push(&client_list, nbsl_top(&client_list), &c->link)) {
 		/* spin */
 	}
 }
@@ -173,17 +127,20 @@ static void tick(unsigned long old_epoch)
 static void maybe_tick(unsigned long epoch, struct e_client *self)
 {
 	assert(e_inside());
-	struct e_client *c = atomic_load_explicit(&client_list,
-		memory_order_consume);
+
 	bool quiet = true;
-	while(c != NULL) {
+	struct nbsl_iter it;
+	for(struct nbsl_node *cur = nbsl_first(&client_list, &it);
+		cur != NULL;
+		cur = nbsl_next(&client_list, &it))
+	{
+		struct e_client *c = container_of(cur, struct e_client, link);
 		unsigned long c_epoch = atomic_load_explicit(&c->epoch,
 			memory_order_relaxed);
 		if(c != self && c_epoch > 0 && c_epoch < epoch) {
 			quiet = false;
 			break;
 		}
-		c = atomic_load_explicit(&c->next, memory_order_consume);
 	}
 	if(quiet) tick(epoch);
 }
