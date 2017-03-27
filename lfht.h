@@ -7,14 +7,16 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 
+#include "nbsl.h"
+
 
 #define CACHELINE_ALIGN __attribute__((aligned(64)))
 
 
 struct lfht_table
 {
-	/* cmpxchg-only; new value may only be NULL (remove from tail). */
-	struct lfht_table *_Atomic next;
+	struct nbsl_node link;	/* in <struct lfht>.tables */
+
 	/* synced with something else; "eventually consistent" */
 	size_t elems, deleted;
 	/* monotonically decreasing */
@@ -35,7 +37,7 @@ struct lfht_table
 
 struct lfht
 {
-	struct lfht_table *_Atomic main;	/* cmpxchg-only */
+	struct nbsl tables;
 
 	/* constants */
 	size_t (*rehash_fn)(const void *ptr, void *priv);
@@ -44,7 +46,7 @@ struct lfht
 
 
 #define LFHT_INITIALIZER(name, rehash, priv) \
-	{ NULL, (rehash), (priv) }
+	{ NBSL_LIST_INIT(name.tables), (rehash), (priv) }
 
 
 extern void lfht_init(

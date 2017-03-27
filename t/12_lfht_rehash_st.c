@@ -14,6 +14,7 @@
 #include <ccan/tap/tap.h>
 #include <ccan/hash/hash.h>
 #include <ccan/htable/htable.h>
+#include <ccan/container_of/container_of.h>
 
 #include "epoch.h"
 #include "lfht.h"
@@ -77,8 +78,11 @@ int main(void)
 		}
 
 		if(!saw_rehash) {
-			struct lfht_table *t = atomic_load(&ht.main),
-				*next = atomic_load(&t->next);
+			struct nbsl_iter it;
+			struct lfht_table *t = container_of(nbsl_first(&ht.tables, &it),
+					struct lfht_table, link),
+				*next = container_of(nbsl_next(&ht.tables, &it),
+					struct lfht_table, link);
 			if(next != NULL && next->size_log2 == t->size_log2) {
 				saw_rehash = true;
 			}

@@ -7,6 +7,7 @@
 #include <assert.h>
 
 #include <ccan/likely/likely.h>
+#include <ccan/container_of/container_of.h>
 
 #include "lfht.h"
 #include "epoch.h"
@@ -28,6 +29,19 @@ static inline bool entry_is_valid(uintptr_t e) {
 
 static inline bool entry_is_avail(uintptr_t e) {
 	return e != LFHT_NA_FULL && e != LFHT_NA_EMPTY;
+}
+
+
+static inline struct lfht_table *get_main(const struct lfht *lfht) {
+	return container_of_or_null(nbsl_top(&lfht->tables),
+		struct lfht_table, link);
+}
+
+
+static inline struct lfht_table *get_next(const struct lfht_table *tab) {
+	/* FIXME: make a function in nbsl.h for this */
+	struct nbsl_node *n = (struct nbsl_node *)(tab->link.next & ~(uintptr_t)3);
+	return container_of_or_null(n, struct lfht_table, link);
 }
 
 
@@ -103,7 +117,7 @@ static struct lfht_table *new_table(int sizelog2)
 	struct lfht_table *tab = aligned_alloc(
 		alignof(struct lfht_table), sizeof(*tab));
 	if(tab == NULL) return NULL;
-	tab->next = NULL;
+	tab->link.next = 0;
 	tab->elems = 0; tab->deleted = 0;
 	tab->mig_left = 1L << sizelog2;
 	tab->mig_next = (1L << sizelog2) - 1;
@@ -123,8 +137,8 @@ static struct lfht_table *new_table(int sizelog2)
 }
 
 
-/* install a new @ht->main until its common mask & bits accommodate @model.
- * returns NULL on malloc() failure.
+/* try to install a new main table until the main table's common mask & bits
+ * accommodate @model. returns NULL on malloc() failure.
  */
 static struct lfht_table *remask_table(
 	struct lfht *ht, struct lfht_table *tab, void *model)
@@ -136,12 +150,13 @@ static struct lfht_table *remask_table(
 
 	for(;;) {
 		set_bits(nt, tab, model);
-		nt->next = tab;
 		nt->gen_id = tab->gen_id + 1;
-		if(atomic_compare_exchange_strong(&ht->main, &tab, nt)) {
+		if(nbsl_push(&ht->tables, &tab->link, &nt->link)) {
 			/* i won! i won! */
 			return nt;
-		} else if(((uintptr_t)model & tab->common_mask) == tab->common_bits) {
+		}
+		tab = get_main(ht);
+		if(((uintptr_t)model & tab->common_mask) == tab->common_bits) {
 			/* concurrently replaced with a conforming table, superceding
 			 * ours.
 			 */
@@ -155,7 +170,7 @@ static struct lfht_table *remask_table(
 			nt = new_table(tab->size_log2);
 			if(nt == NULL) return NULL;
 		} else {
-			/* concurrent remask or rehash. retry w/ same table. */
+			/* concurrent remask or rehash. retry w/ same new table. */
 		}
 	}
 }
@@ -173,10 +188,10 @@ static struct lfht_table *double_table(
 
 	for(;;) {
 		set_bits(nt, tab, model);
-		nt->next = tab;
 		nt->gen_id = tab->gen_id + 1;
-		if(atomic_compare_exchange_strong(&ht->main, &tab, nt)) return nt;
-		else if(tab->size_log2 >= nt->size_log2) {
+		if(nbsl_push(&ht->tables, &tab->link, &nt->link)) return nt;
+		tab = get_main(ht);
+		if(tab->size_log2 >= nt->size_log2) {
 			/* resized by another thread. */
 			free(nt->table);
 			free(nt);
@@ -198,8 +213,8 @@ static struct lfht_table *double_table(
 
 
 /* install a new table of exactly the same size. ht_add() will migrate two
- * items at a time while the new table remains @ht->main. if malloc fails,
- * return @tab; if switching fails, return the new table.
+ * items at a time while the new table remains @ht's main table. if malloc
+ * fails, return @tab; if switching fails, return the new table.
  */
 static struct lfht_table *rehash_table(
 	struct lfht *ht, struct lfht_table *tab)
@@ -207,12 +222,12 @@ static struct lfht_table *rehash_table(
 	struct lfht_table *nt = new_table(tab->size_log2);
 	if(nt == NULL) return tab;
 	set_bits(nt, tab, NULL);
-	nt->next = tab;
 	nt->gen_id = tab->gen_id + 1;
-	if(atomic_compare_exchange_strong(&ht->main, &tab, nt)) tab = nt;
+	if(nbsl_push(&ht->tables, &tab->link, &nt->link)) tab = nt;
 	else {
 		free(nt->table);
 		free(nt);
+		tab = get_main(ht);
 	}
 	return tab;
 }
@@ -229,25 +244,11 @@ static void table_dtor(struct lfht_table *tab)
 static void remove_table(struct lfht *ht, struct lfht_table *tab)
 {
 	assert(tab != NULL);
-	assert(tab->next == NULL);
+	assert(get_next(tab) == NULL);
 
-	struct lfht_table *_Atomic *pp = &ht->main;
-	for(;;) {
-		struct lfht_table *prev = atomic_load_explicit(pp,
-			memory_order_relaxed);
-		if(prev == tab) break;
-		if(unlikely(prev == NULL)) {
-			/* concurrent removals may happen after the split-counter series,
-			 * so let's allow this.
-			 */
-			return;
-		}
-		pp = &prev->next;
+	if(nbsl_del(&ht->tables, &tab->link)) {
+		e_call_dtor(&table_dtor, tab);
 	}
-
-	struct lfht_table *old = atomic_exchange(pp, NULL);
-	assert(old == tab || old == NULL);
-	if(old != NULL) e_call_dtor(&table_dtor, old);
 }
 
 
@@ -359,8 +360,8 @@ static void *ht_val(
 }
 
 
-/* check an entry in @src, migrate it to @dst (or @ht->main) if valid. returns
- * true when @src became empty, or was already.
+/* check an entry in @src, migrate it to @dst (or @ht's main table) if valid.
+ * returns true when @src became empty, or was already.
  */
 static bool ht_migrate_entry(
 	struct lfht *ht, struct lfht_table *dst, struct lfht_table *src)
@@ -407,8 +408,7 @@ dst_retry:
 		} else {
 			/* @dst was made secondary. refetch and try again. */
 			atomic_fetch_sub_explicit(&dst->elems, 1, memory_order_relaxed);
-			struct lfht_table *rarest = atomic_load_explicit(&ht->main,
-				memory_order_relaxed);
+			struct lfht_table *rarest = get_main(ht);
 			assert(rarest != dst);
 			dst = rarest;
 			goto dst_retry;
@@ -430,8 +430,8 @@ dst_retry:
 
 
 /* examine and possibly migrate one entry from a smaller secondary table into
- * @ht->main (double), or three from an equal-sized secondary table or if
- * there's more than one secondary table (rehash/remask).
+ * @ht's main table (double), or three from an equal-sized secondary table or
+ * if there's more than one secondary table (rehash/remask).
  *
  * the doubling of size ensures that the secondary is emptied by the time the
  * primary fills up, and the doubling threshold's kicking in at 3/4 full means
@@ -440,14 +440,12 @@ dst_retry:
  */
 static void ht_migrate(struct lfht *ht, struct lfht_table *dst)
 {
-	struct lfht_table *sec = atomic_load_explicit(&dst->next,
-		memory_order_relaxed);
+	struct lfht_table *sec = get_next(dst);
 	if(sec == NULL) return;		/* nothing to do! */
 
 	bool single = true;
 	for(;;) {
-		struct lfht_table *next = atomic_load_explicit(&sec->next,
-			memory_order_relaxed);
+		struct lfht_table *next = get_next(sec);
 		if(next == NULL) break;
 		single = false;
 		sec = next;
@@ -484,7 +482,8 @@ bool lfht_init_sized(
 	if(tab == NULL) return false;
 	else {
 		set_bits(tab, NULL, NULL);
-		atomic_store_explicit(&ht->main, tab, memory_order_release);
+		bool ok = nbsl_push(&ht->tables, NULL, &tab->link);
+		if(!ok) abort();		/* FIXME */
 		return true;
 	}
 }
@@ -493,18 +492,15 @@ bool lfht_init_sized(
 void lfht_clear(struct lfht *ht)
 {
 	int eck = e_begin();
-	struct lfht_table *_Atomic *pp = &ht->main;
-	for(;;) {
-		struct lfht_table *tab = atomic_load_explicit(pp,
-			memory_order_relaxed);
-		if(tab == NULL) break;	/* end */
-		if(!atomic_compare_exchange_strong(pp, &tab, NULL)) {
-			/* concurrent lfht_clear(); let it/them run */
-			break;
-		}
-		pp = &tab->next;
+	struct nbsl_iter it;
+	for(struct nbsl_node *cur = nbsl_first(&ht->tables, &it);
+		cur != NULL;
+		cur = nbsl_next(&ht->tables, &it))
+	{
+		struct lfht_table *tab = container_of(cur, struct lfht_table, link);
+		if(!nbsl_del_at(&ht->tables, &it)) continue;
 		e_free(tab->table);
-		e_free(tab);	/* NOTE: this doesn't invalidate *pp. */
+		e_free(tab);
 	}
 	e_end(eck);
 }
@@ -514,17 +510,15 @@ bool lfht_add(struct lfht *ht, size_t hash, void *p)
 {
 	int eck = e_begin();
 
-	struct lfht_table *tab = atomic_load_explicit(&ht->main,
-		memory_order_relaxed);
+	struct lfht_table *tab = get_main(ht);
 	if(unlikely(tab == NULL)) {
 		tab = new_table(MIN_SIZE_LOG2);
 		if(tab == NULL) goto fail;
 		set_bits(tab, NULL, p);
-		struct lfht_table *old = NULL;
-		if(!atomic_compare_exchange_strong(&ht->main, &old, tab)) {
+		if(!nbsl_push(&ht->tables, NULL, &tab->link)) {
 			free(tab->table);
 			free(tab);
-			tab = old;
+			tab = get_main(ht);
 		}
 	}
 
@@ -561,7 +555,7 @@ retry:
 		 * would land. undo and retry to avoid a further off-cpu migration.
 		 */
 		atomic_fetch_sub_explicit(&tab->elems, 1, memory_order_relaxed);
-		tab = atomic_load_explicit(&ht->main, memory_order_relaxed);
+		tab = get_main(ht);
 		goto retry;
 	}
 
@@ -627,20 +621,23 @@ static inline void lfht_iter_init(
 
 
 /* finds table that has the lowest gen_id greater than @prev->gen_id. returns
- * NULL when @prev == @ht->main.
+ * NULL when @prev is @ht's main table.
  */
 static struct lfht_table *next_table_gen(
 	const struct lfht *ht, const struct lfht_table *prev)
 {
 	unsigned long prev_gen = prev->gen_id;
-	struct lfht_table *next,
-		*t = atomic_load_explicit(&ht->main, memory_order_relaxed);
-	assert(t != NULL);
-	if(t == prev) return NULL;
-	for(;;) {
-		next = atomic_load_explicit(&t->next, memory_order_relaxed);
-		if(next == NULL || next->gen_id <= prev_gen) break;
-		t = next;
+	struct lfht_table *t = NULL;
+
+	struct nbsl_iter it;
+	for(struct nbsl_node *cur = nbsl_first(&ht->tables, &it);
+		cur != NULL;
+		cur = nbsl_next(&ht->tables, &it))
+	{
+		if(cur == &prev->link) break;
+		struct lfht_table *cand = container_of(cur, struct lfht_table, link);
+		if(cand->gen_id <= prev_gen) break;
+		t = cand;
 	}
 
 	return t;
@@ -651,13 +648,17 @@ void *lfht_firstval(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 {
 	assert(e_inside());
 
-	struct lfht_table *next, *tab = atomic_load_explicit(&ht->main,
-		memory_order_relaxed);
-	if(unlikely(tab == NULL)) return NULL;
-	do {
-		next = atomic_load_explicit(&tab->next, memory_order_relaxed);
-		if(next != NULL) tab = next;
-	} while(next != NULL);
+	struct lfht_table *tab = get_main(ht);
+	if(tab == NULL) return NULL;
+
+	/* get the very last table. */
+	struct nbsl_iter i;
+	for(struct nbsl_node *cur = nbsl_first(&ht->tables, &i);
+		cur != NULL;
+		cur = nbsl_next(&ht->tables, &i))
+	{
+		tab = container_of(cur, struct lfht_table, link);
+	}
 
 	lfht_iter_init(it, tab, hash);
 	for(;;) {
