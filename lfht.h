@@ -10,6 +10,8 @@
 #include "nbsl.h"
 
 
+#define LFHT_MIN_TABLE_SIZE 5	/* 32 entries = 2 cachelines on LP64 */
+
 #define CACHELINE_ALIGN __attribute__((aligned(64)))
 
 
@@ -17,21 +19,21 @@ struct lfht_table
 {
 	struct nbsl_node link;	/* in <struct lfht>.tables */
 
-	/* synced with something else; "eventually consistent" */
+	/* consistent at `link' or `table' release */
 	size_t elems, deleted;
 	/* monotonically decreasing */
 	_Atomic ssize_t mig_next, mig_left;
 
 	/* constants */
-	uintptr_t *table CACHELINE_ALIGN;	/* allocated separately b/c cache hazard */
+	uintptr_t *table CACHELINE_ALIGN;	/* allocated separately */
 	/* common_mask indicates bits that're the same across all keys;
 	 * common_bits specifies what those bits are. perfect_bit, when nonzero,
 	 * is always set in common_mask, and cleared in common_bits.
 	 */
 	uintptr_t common_mask, common_bits, perfect_bit;
-	unsigned int size_log2;		/* 1 << size_log2 < SSIZE_MAX */
 	unsigned long gen_id;		/* next == NULL || gen_id > next->gen_id */
 	size_t max, max_with_deleted;
+	unsigned int size_log2;		/* 1 << size_log2 < SSIZE_MAX */
 };
 
 
@@ -42,18 +44,19 @@ struct lfht
 	/* constants */
 	size_t (*rehash_fn)(const void *ptr, void *priv);
 	void *priv;
+	unsigned int first_size_log2;	/* size of first table */
 };
 
 
 #define LFHT_INITIALIZER(name, rehash, priv) \
-	{ NBSL_LIST_INIT(name.tables), (rehash), (priv) }
+	{ NBSL_LIST_INIT(name.tables), (rehash), (priv), LFHT_MIN_TABLE_SIZE }
 
 
 extern void lfht_init(
 	struct lfht *ht,
 	size_t (*rehash_fn)(const void *ptr, void *priv), void *priv);
 
-extern bool lfht_init_sized(
+extern void lfht_init_sized(
 	struct lfht *ht,
 	size_t (*rehash_fn)(const void *ptr, void *priv), void *priv,
 	size_t size);

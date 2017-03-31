@@ -17,7 +17,7 @@
 #define LFHT_NA_FULL (~(uintptr_t)0)
 #define LFHT_NA_EMPTY (LFHT_NA_FULL & ~(uintptr_t)1)
 
-#define MIN_SIZE_LOG2 5		/* 2 cachelines' worth */
+#define MIN_SIZE_LOG2 LFHT_MIN_TABLE_SIZE
 
 #define POPCOUNT(x) __builtin_popcount((x))
 
@@ -65,19 +65,8 @@ static void set_bits(
 		 */
 		tab->common_mask = (~(uintptr_t)0 << (MIN_SIZE_LOG2 + 4)) | 0x1f;
 		tab->perfect_bit = get_perfect_bit(tab->common_mask);
-		if(model != NULL) tab->common_bits = (uintptr_t)model;
-		else {
-			/* synthesize a typical common value that the allocator is likely
-			 * to hand out.
-			 */
-			void *ptr = malloc(1);
-			if(ptr == NULL) tab->common_bits = (uintptr_t)tab;	/* or worse */
-			else {
-				tab->common_bits = (uintptr_t)ptr;
-				free(ptr);
-			}
-		}
-		tab->common_bits &= tab->common_mask;
+		assert(model != NULL);
+		tab->common_bits = (uintptr_t)model & tab->common_mask;
 	} else {
 		tab->common_mask = prev->common_mask;
 		tab->common_bits = prev->common_bits;
@@ -467,7 +456,7 @@ void lfht_init(
 }
 
 
-bool lfht_init_sized(
+void lfht_init_sized(
 	struct lfht *ht,
 	size_t (*rehash_fn)(const void *ptr, void *priv), void *priv,
 	size_t size)
@@ -478,14 +467,7 @@ bool lfht_init_sized(
 		sizelog2++;
 		if(sizelog2 == sizeof(long) * 8 - 1) break;
 	}
-	struct lfht_table *tab = new_table(sizelog2);
-	if(tab == NULL) return false;
-	else {
-		set_bits(tab, NULL, NULL);
-		bool ok = nbsl_push(&ht->tables, NULL, &tab->link);
-		if(!ok) abort();		/* FIXME */
-		return true;
-	}
+	ht->first_size_log2 = sizelog2;
 }
 
 
