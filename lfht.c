@@ -18,6 +18,7 @@
 #define LFHT_NA_EMPTY (LFHT_NA_FULL & ~(uintptr_t)1)
 
 #define MIN_SIZE_LOG2 LFHT_MIN_TABLE_SIZE
+#define MIN_PROBE (64 * 2 / sizeof(uintptr_t))
 
 #define POPCOUNT(x) __builtin_popcount((x))
 
@@ -121,6 +122,17 @@ static struct lfht_table *new_table(int sizelog2)
 	/* from CCAN htable */
 	tab->max = ((size_t)3 << sizelog2) / 4;
 	tab->max_with_deleted = ((size_t)9 << sizelog2) / 10;
+
+	/* set max probe depth to max(16, n_entries / 32), i.e. as low as two
+	 * cachelines on 64-bit which'll touch 3 cachelines on average. this
+	 * causes mildly pessimal performance (and heavy reliance on the runtime's
+	 * lazy heap) when a single hash chain is very long, or the hash function
+	 * generates a poor distribution from e.g. strings that share a prefix,
+	 * such as multiply-accumulate variations; but then recovers as the table
+	 * gets bigger.
+	 */
+	tab->max_probe = (1ul << sizelog2) / 32;
+	if(tab->max_probe < MIN_PROBE) tab->max_probe = MIN_PROBE;
 
 	return tab;
 }
@@ -275,14 +287,18 @@ static inline void *get_raw_ptr(const struct lfht_table *tab, uintptr_t e) {
 }
 
 
-static bool ht_add(struct lfht_table *tab, const void *p, size_t hash)
+/* returns 0 on success, 1 to indicate that the caller should reload @tab, and
+ * -1 when probe distance was exceeded.
+ */
+static int ht_add(struct lfht_table *tab, const void *p, size_t hash)
 {
 	assert(((uintptr_t)p & tab->common_mask) == tab->common_bits);
 	assert(POPCOUNT(tab->perfect_bit) <= 1);
 	assert((tab->common_bits & tab->perfect_bit) == 0);
 	uintptr_t perfect = tab->perfect_bit;
-	size_t mask = (1ul << tab->size_log2) - 1, start = hash & mask;
-	size_t i = start;
+	size_t mask = (1ul << tab->size_log2) - 1, start = hash & mask,
+		end = (start + tab->max_probe) & mask,
+		i = start;
 	do {
 		uintptr_t e = atomic_load_explicit(&tab->table[i],
 			memory_order_relaxed);
@@ -292,7 +308,7 @@ static bool ht_add(struct lfht_table *tab, const void *p, size_t hash)
 				 * ht_add() should be tried again on the primary. this avoids
 				 * an off-cpu migration, so it's worth it.
 				 */
-				return false;
+				return 1;
 			}
 		} else {
 			uintptr_t hval;
@@ -307,7 +323,7 @@ retry:
 			if(atomic_compare_exchange_strong_explicit(&tab->table[i], &e, hval,
 				memory_order_release, memory_order_relaxed))
 			{
-				return true;
+				return 0;
 			} else if(!entry_is_valid(e)) {
 				/* exotic case: an empty slot was filled, then deleted. try
 				 * again but fancily.
@@ -321,11 +337,15 @@ retry:
 		}
 		i = (i + 1) & mask;
 		perfect = 0;
-	} while(i != start);
-	return false;
+	} while(i != end);
+	return -1;
 }
 
 
+/* NOTE: the perfect-bit handling here looks wrong, but that's because
+ * @it->perfect is cleared in lfht_nextval(). this is just a tiny bit more
+ * microefficient.
+ */
 static void *ht_val(
 	const struct lfht *ht, struct lfht_iter *it, size_t hash)
 {
@@ -343,7 +363,7 @@ static void *ht_val(
 		}
 		it->off = (it->off + 1) & mask;
 		h2 &= ~perfect;
-	} while(it->off != (hash & mask));
+	} while(it->off != it->end);
 
 	return NULL;
 }
@@ -372,34 +392,59 @@ e_retry:
 			goto e_retry;
 		}
 	} else {
-		size_t elems;
-
 dst_retry:
-		elems = atomic_fetch_add_explicit(&dst->elems, 1,
+		atomic_fetch_add_explicit(&dst->elems, 1,
 			memory_order_relaxed);
-		assert(elems + 1 <= (1ul << dst->size_log2));
 		void *ptr = get_raw_ptr(src, e);
 		size_t hash = (*ht->rehash_fn)(ptr, ht->priv);
-		/* !ok implies concurrent migration from @dst. */
-		bool ok = ht_add(dst, ptr, hash);
-		if(ok && atomic_compare_exchange_strong_explicit(&src->table[spos],
+		int n = ht_add(dst, ptr, hash);
+		if(n == 0 && atomic_compare_exchange_strong_explicit(&src->table[spos],
 			&e, LFHT_NA_FULL, memory_order_relaxed, memory_order_relaxed))
 		{
 			atomic_fetch_sub_explicit(&src->elems, 1, memory_order_release);
-		} else if(ok) {
+		} else if(n == 0) {
 			/* deleted under our feet. that's fine. */
 			assert(!entry_is_valid(e));
 			assert(entry_is_avail(e));
 			/* drop the extra item from wherever it wound up at. */
-			ok = lfht_del(ht, hash, ptr);
+			bool ok = lfht_del(ht, hash, ptr);
 			assert(ok);
 			goto e_retry;
-		} else {
+		} else if(n > 0) {
 			/* @dst was made secondary. refetch and try again. */
 			atomic_fetch_sub_explicit(&dst->elems, 1, memory_order_relaxed);
 			struct lfht_table *rarest = get_main(ht);
 			assert(rarest != dst);
 			dst = rarest;
+			goto dst_retry;
+		} else {
+			assert(n < 0);
+			/* ptr/hash can't be inserted because probe length was exceeded.
+			 *
+			 * every hash chain in @src should be as long or shorter when
+			 * moved into @dst, but it's possible for items added to @dst to
+			 * increase a chain past that limit, particularly with rehash and
+			 * remask tables.
+			 */
+			atomic_fetch_sub_explicit(&dst->elems, 1, memory_order_relaxed);
+			dst = double_table(ht, dst, ptr);
+			if(dst == NULL) {
+				/* FIXME: doubling @dst here seems like a good idea, but the
+				 * malloc failure must be handled somehow. this is hard
+				 * because `mig_next' has already been decremented, meaning
+				 * that we've promised to move the entry out in some capacity.
+				 *
+				 * a simple solution would mark incomplete migration on this
+				 * table and retain it until total elems reaches zero, checked
+				 * in lfht_delval(). migration would resume into a different
+				 * primary table. with these, doubling here would be
+				 * unnecessary and ht_migrate_entry() could go back to being
+				 * the strictly reducing operation.
+				 *
+				 * for now, break apart and explode.
+				 */
+				abort();
+			}
 			goto dst_retry;
 		}
 	}
@@ -504,40 +549,41 @@ bool lfht_add(struct lfht *ht, size_t hash, void *p)
 		}
 	}
 
-	/* ensure @tab has room for the new item, and won't fill up concurrently.
-	 * if it would've filled up, add the next size of table. this is
-	 * non-terminating under pathological circumstances, where room for the
-	 * new element is instantly consumed by concurrent access.
-	 */
-	size_t elems;
-
 retry:
-	elems = atomic_fetch_add_explicit(&tab->elems, 1, memory_order_relaxed);
+	atomic_fetch_add_explicit(&tab->elems, 1, memory_order_relaxed);
+
 	if(((uintptr_t)p & tab->common_mask) != tab->common_bits) {
 		atomic_fetch_sub_explicit(&tab->elems, 1, memory_order_relaxed);
 		tab = remask_table(ht, tab, p);
 		if(tab == NULL) goto fail;
 		goto retry;
-	} else if(elems + 1 > tab->max) {
-		atomic_fetch_sub_explicit(&tab->elems, 1, memory_order_relaxed);
-		tab = double_table(ht, tab, p);
-		if(tab == NULL) goto fail;
-		goto retry;
-	} else if(elems + 1 + tab->deleted > tab->max_with_deleted) {
-		struct lfht_table *oldtab = tab;
-		tab = rehash_table(ht, tab);
-		if(likely(tab != oldtab)) {
-			atomic_fetch_sub_explicit(&oldtab->elems, 1, memory_order_relaxed);
-			goto retry;
-		}
 	}
 
-	if(!ht_add(tab, p, hash)) {
+	int n = ht_add(tab, p, hash);
+	if(n > 0) {
 		/* tab was made secondary and migration twilight reached where @hash
 		 * would land. undo and retry to avoid a further off-cpu migration.
 		 */
 		atomic_fetch_sub_explicit(&tab->elems, 1, memory_order_relaxed);
 		tab = get_main(ht);
+		goto retry;
+	} else if(n < 0) {
+		/* probe limit was reached. double or rehash the table. */
+		size_t elems = tab->elems, deleted = tab->deleted;
+		if(elems + 1 <= tab->max
+			&& elems + 1 + deleted > tab->max_with_deleted)
+		{
+			struct lfht_table *oldtab = tab;
+			tab = rehash_table(ht, tab);
+			if(likely(tab != oldtab)) {
+				atomic_fetch_sub_explicit(&oldtab->elems, 1,
+					memory_order_relaxed);
+			}
+		} else {
+			atomic_fetch_sub_explicit(&tab->elems, 1, memory_order_relaxed);
+			tab = double_table(ht, tab, p);
+			if(tab == NULL) goto fail;
+		}
 		goto retry;
 	}
 
@@ -595,10 +641,11 @@ bool lfht_del(struct lfht *ht, size_t hash, const void *p)
 static inline void lfht_iter_init(
 	struct lfht_iter *it, struct lfht_table *tab, size_t hash)
 {
+	size_t mask = (1ul << tab->size_log2) - 1;
 	it->t = tab;
-	it->start = hash & ((1ul << it->t->size_log2) - 1);
+	it->off = hash & mask;
+	it->end = (it->off + tab->max_probe) & mask;
 	it->perfect = tab->perfect_bit;
-	it->off = it->start;
 }
 
 
@@ -668,7 +715,7 @@ void *lfht_nextval(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 	it->off = (it->off + 1) & mask;
 
 	void *ptr;
-	if(it->off != it->start && (ptr = ht_val(ht, it, hash)) != NULL) {
+	if(it->off != it->end && (ptr = ht_val(ht, it, hash)) != NULL) {
 		return ptr;
 	}
 

@@ -32,7 +32,7 @@ struct lfht_table
 	 */
 	uintptr_t common_mask, common_bits, perfect_bit;
 	unsigned long gen_id;		/* next == NULL || gen_id > next->gen_id */
-	size_t max, max_with_deleted;
+	size_t max, max_with_deleted, max_probe;
 	unsigned int size_log2;		/* 1 << size_log2 < SSIZE_MAX */
 };
 
@@ -68,9 +68,12 @@ extern void lfht_clear(struct lfht *ht);
 extern bool lfht_add(struct lfht *ht, size_t hash, void *p);
 extern bool lfht_del(struct lfht *ht, size_t hash, const void *p);
 
+/* valid for lfht_del_at() iff ->off != ->end, or rather,
+ * ->off < ->end (mod @t->size).
+ */
 struct lfht_iter {
 	struct lfht_table *t;
-	size_t off, start;
+	size_t off, end;
 	uintptr_t perfect;
 };
 
