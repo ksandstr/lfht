@@ -151,9 +151,14 @@ int e_begin(void)
 	struct e_client *c = get_client();
 	if(c->epoch > 0) return 0;	/* inner begin; disregard. */
 
-	unsigned long epoch = atomic_load_explicit(&global_epoch,
-		memory_order_consume);
-	atomic_store_explicit(&c->epoch, epoch, memory_order_release);
+	/* has to happen in a loop due to preëmption effects. fortunately this is
+	 * completely valid.
+	 */
+	unsigned long epoch = 0;
+	do {
+		epoch = atomic_load_explicit(&global_epoch, memory_order_consume);
+		atomic_store_explicit(&c->epoch, epoch, memory_order_release);
+	} while(epoch != atomic_load_explicit(&global_epoch, memory_order_relaxed));
 	return 1;
 }
 
