@@ -22,11 +22,14 @@
 
 struct e_client
 {
-	struct nbsl_node link;
-	_Atomic unsigned long epoch;	/* 0 for idle. */
+	/* thread private */
 	size_t count_since_tick;
-
 	bool initialized;
+
+	/* concurrent access */
+	struct nbsl_node link __attribute__((aligned(64)));
+	_Atomic unsigned long epoch;	/* valid iff active > 0. */
+	_Atomic int active;				/* 0 for idle */
 };
 
 
@@ -203,9 +206,9 @@ static void maybe_tick(unsigned long epoch, struct e_client *self)
 		cur = nbsl_next(&client_list, &it))
 	{
 		struct e_client *c = container_of(cur, struct e_client, link);
-		unsigned long c_epoch = atomic_load_explicit(&c->epoch,
-			memory_order_relaxed);
-		if(c != self && c_epoch > 0 && c_epoch < epoch) {
+		int c_active = atomic_load(&c->active);
+		unsigned long c_epoch = atomic_load(&c->epoch);
+		if(c != self && c_active > 0 && c_epoch < epoch) {
 			quiet = false;
 			break;
 		}
@@ -223,16 +226,21 @@ static void maybe_tick(unsigned long epoch, struct e_client *self)
 int e_begin(void)
 {
 	struct e_client *c = get_client();
-	if(c->epoch > 0) return 0;	/* inner begin; disregard. */
+	if(atomic_fetch_add(&c->active, 1) > 0) {
+		/* nested */
+		return 0;
+	}
 
-	/* has to happen in a loop due to preëmption effects. fortunately this is
-	 * completely valid.
+	/* has to happen in a loop. fortunately this is completely valid. the
+	 * "active" flag up there ensures that this terminates at the latest when
+	 * all other threads in the system have ticked the epoch twice, which is
+	 * better than the indefinite live-locked spinning that'd happen without.
 	 */
 	unsigned long epoch = 0;
 	do {
-		epoch = atomic_load_explicit(&global_epoch, memory_order_consume);
-		atomic_store_explicit(&c->epoch, epoch, memory_order_release);
-	} while(epoch != atomic_load_explicit(&global_epoch, memory_order_relaxed));
+		epoch = atomic_load(&global_epoch);
+		atomic_store(&c->epoch, epoch);
+	} while(epoch != atomic_load(&global_epoch));
 	return 1;
 }
 
@@ -251,29 +259,31 @@ static size_t sum_counts(int e)
 void e_end(int cookie)
 {
 	struct e_client *c = get_client();
-	if(cookie == 0) return;
-
-	/* try to tick forward only if the counts say so. examine all counts every
-	 * 16 brackets, resetting at tick.
-	 */
-	bool deep = (++c->count_since_tick & 0x1f) == 0;
-	unsigned long epoch = atomic_load_explicit(&global_epoch,
-		memory_order_consume);
-	assert(epoch == c->epoch || epoch == next_epoch(c->epoch));
-	if(GET_BUCKET()->count[epoch & 3] > 0
-		|| (deep && sum_counts(epoch & 3) > 0))
-	{
-		maybe_tick(epoch, c);
+	int old_active = atomic_load_explicit(&c->active, memory_order_relaxed);
+	assert(old_active > 0);
+	if(old_active == 1) {
+		/* try to tick forward only if the counts say so. examine all counts
+		 * every 16 brackets, resetting at tick.
+		 */
+		bool deep = (++c->count_since_tick & 0x1f) == 0;
+		unsigned long epoch = atomic_load_explicit(&global_epoch,
+			memory_order_consume);
+		assert(epoch == c->epoch || epoch == next_epoch(c->epoch));
+		if(GET_BUCKET()->count[epoch & 3] > 0
+			|| (deep && sum_counts(epoch & 3) > 0))
+		{
+			maybe_tick(epoch, c);
+		}
 	}
-
-	atomic_store_explicit(&c->epoch, 0, memory_order_release);
+	old_active = atomic_fetch_sub(&c->active, 1);
+	assert(old_active > 0);
 }
 
 
 bool e_inside(void)
 {
 	struct e_client *c = get_client();
-	return c->epoch > 0;
+	return atomic_load_explicit(&c->active, memory_order_relaxed) > 0;
 }
 
 
