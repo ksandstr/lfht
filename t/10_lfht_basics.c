@@ -13,7 +13,7 @@
 
 
 static size_t str_hash_fn(const void *key, void *priv) {
-	return hash_string(key);
+	return hashl(key, strlen(key), (uintptr_t)priv);
 }
 
 
@@ -23,7 +23,8 @@ static bool cmp_str_ptr(const void *cand, void *ref) {
 
 
 static bool str_in(struct lfht *ht, const char *str) {
-	const char *s = lfht_get(ht, hash_string(str), &cmp_str_ptr, str);
+	const char *s = lfht_get(ht, str_hash_fn(str, NULL),
+		&cmp_str_ptr, str);
 	assert(s == NULL || strcmp(s, str) == 0);
 	return s != NULL;
 }
@@ -47,9 +48,9 @@ int main(void)
 	for(int i=0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
 		memset(&ht, 0xfd - i, sizeof(ht));
 		lfht_init_sized(&ht, &str_hash_fn, NULL, sizes[i]);
-		bool ok = lfht_add(&ht, hash_string("foo"), "foo");
+		bool ok = lfht_add(&ht, str_hash_fn("foo", NULL), "foo");
 		assert(ok);
-		ok = lfht_add(&ht, hash_string("bar"), "bar");
+		ok = lfht_add(&ht, str_hash_fn("bar", NULL), "bar");
 		assert(ok);
 		lfht_clear(&ht);
 		pass("survived simple adds after lfht_init_sized(..., %d)", sizes[i]);
@@ -59,12 +60,12 @@ int main(void)
 	int eck = e_begin();
 	lfht_init(&ht, &str_hash_fn, NULL);
 	ok1(!str_in(&ht, "foo"));
-	bool ok = lfht_add(&ht, hash_string("foo"), "foo");
+	bool ok = lfht_add(&ht, str_hash_fn("foo", NULL), "foo");
 	ok(ok, "add `foo'");
 	ok1(str_in(&ht, "foo"));
-	ok = lfht_del(&ht, hash_string("foo"), "foo");
+	ok = lfht_del(&ht, str_hash_fn("foo", NULL), "foo");
 	ok(ok, "del `foo'");
-	ok = lfht_del(&ht, hash_string("foo"), "foo");
+	ok = lfht_del(&ht, str_hash_fn("foo", NULL), "foo");
 	ok(!ok, "!del `foo'");
 	ok1(!str_in(&ht, "foo"));
 	lfht_clear(&ht);

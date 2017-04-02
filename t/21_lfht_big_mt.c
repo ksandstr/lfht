@@ -25,7 +25,7 @@ static pthread_barrier_t start_bar;
 
 
 static size_t str_hash_fn(const void *key, void *priv) {
-	return hash_string(key);
+	return hashl(key, strlen(key), (uintptr_t)priv);
 }
 
 
@@ -35,7 +35,8 @@ static bool cmp_str_ptr(const void *cand, void *ref) {
 
 
 static bool str_in(struct lfht *ht, const char *str) {
-	const char *s = lfht_get(ht, hash_string(str), &cmp_str_ptr, str);
+	const char *s = lfht_get(ht, str_hash_fn(str, NULL),
+		&cmp_str_ptr, str);
 	assert(s == NULL || strcmp(s, str) == 0);
 	return s != NULL;
 }
@@ -72,7 +73,7 @@ static void *participant_fn(void *param_ptr)
 			diag("%d: found `%s' before it was added", thread_id, s);
 			found_before = true;
 		}
-		bool ok = lfht_add(ht, hash_string(s), s);
+		bool ok = lfht_add(ht, str_hash_fn(s, NULL), s);
 		assert(ok);
 		if(found_immed && !str_in(ht, s)) {
 			diag("%d: didn't find `%s' right after add", thread_id, s);
