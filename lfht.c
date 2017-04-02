@@ -494,7 +494,7 @@ bool lfht_add(struct lfht *ht, size_t hash, void *p)
 
 	struct lfht_table *tab = get_main(ht);
 	if(unlikely(tab == NULL)) {
-		tab = new_table(MIN_SIZE_LOG2);
+		tab = new_table(ht->first_size_log2);
 		if(tab == NULL) goto fail;
 		set_bits(tab, NULL, p);
 		if(!nbsl_push(&ht->tables, NULL, &tab->link)) {
