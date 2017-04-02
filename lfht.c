@@ -23,6 +23,10 @@
 #define POPCOUNT(x) __builtin_popcount((x))
 
 
+static struct lfht_table *next_table_gen(
+	const struct lfht *ht, const struct lfht_table *prev);
+
+
 static inline bool entry_is_valid(uintptr_t e) {
 	return e > LFHT_DELETED;
 }
@@ -245,8 +249,6 @@ static void table_dtor(struct lfht_table *tab)
 static void remove_table(struct lfht *ht, struct lfht_table *tab)
 {
 	assert(tab != NULL);
-	assert(get_next(tab) == NULL);
-
 	if(nbsl_del(&ht->tables, &tab->link)) {
 		e_call_dtor(&table_dtor, tab);
 	}
@@ -487,7 +489,10 @@ static void ht_migrate(struct lfht *ht, struct lfht_table *dst)
 
 	int n_times = dst->size_log2 > sec->size_log2 && single ? 1 : 3;
 	for(int i=0; i < n_times; i++) {
-		if(ht_migrate_entry(ht, dst, sec)) break;
+		if(ht_migrate_entry(ht, dst, sec) && n_times > 1) {
+			sec = next_table_gen(ht, sec);
+			if(sec == NULL || sec == get_main(ht)) break;
+		}
 	}
 }
 
