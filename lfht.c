@@ -463,7 +463,7 @@ dst_retry:
 		memory_order_relaxed) == 1)
 	{
 		/* migration has emptied the table. it can now be removed. */
-		assert(src->mig_next <= 0);
+		assert(src->mig_next <= 0 || src->halt_gen_id > 0);
 		remove_table(ht, src);
 		return true;
 	} else {
