@@ -23,8 +23,17 @@
 #define POPCOUNT(x) __builtin_popcount((x))
 
 
+#define increase_to(ptr, val) do { \
+		typeof((val)) _v = (val); \
+		_Atomic typeof(_v) *_p = (ptr); \
+		typeof(_v) _o = *_p; \
+		while(_o < _v && !atomic_compare_exchange_weak(_p, &_o, _v)) \
+			; \
+	} while(false)
+
+
 static struct lfht_table *next_table_gen(
-	const struct lfht *ht, const struct lfht_table *prev);
+	const struct lfht *ht, const struct lfht_table *prev, bool filter_halted);
 
 
 static inline bool entry_is_valid(uintptr_t e) {
@@ -372,17 +381,26 @@ static void *ht_val(
 
 
 /* check an entry in @src, migrate it to @dst (or @ht's main table) if valid.
- * returns true when @src became empty, or was already.
+ * returns true when @src became empty, was already empty, or migration was
+ * blocked on it.
  */
 static bool ht_migrate_entry(
 	struct lfht *ht, struct lfht_table *dst, struct lfht_table *src)
 {
-	ssize_t spos = atomic_fetch_sub_explicit(&src->mig_next, 1,
-		memory_order_consume);
+	ssize_t spos;
+spos_retry:
+	spos = atomic_fetch_sub_explicit(&src->mig_next, 1, memory_order_consume);
 	if(spos < 0) return true;
 
 	uintptr_t e = atomic_load_explicit(&src->table[spos], memory_order_relaxed);
 e_retry:
+	if(!entry_is_avail(e)) {
+		/* in a table where migration was previously halted, non-available
+		 * rows may be encountered. they should be skipped in a loop.
+		 */
+		assert(src->halt_gen_id > 0);
+		goto spos_retry;
+	}
 	if(!entry_is_valid(e)) {
 		uintptr_t new = e == 0 ? LFHT_NA_EMPTY : LFHT_NA_FULL;
 		if(!atomic_compare_exchange_strong_explicit(&src->table[spos],
@@ -423,31 +441,21 @@ dst_retry:
 			assert(n < 0);
 			/* ptr/hash can't be inserted because probe length was exceeded.
 			 *
-			 * every hash chain in @src should be as long or shorter when
-			 * moved into @dst, but it's possible for items added to @dst to
-			 * increase a chain past that limit, particularly with rehash and
-			 * remask tables.
+			 * most of the time, hash chains in @src should be as long or
+			 * shorter when moved into @dst, but it's possible for items added
+			 * to @dst to increase a chain past that limit, particularly with
+			 * rehash and remask tables. this breaks migration.
+			 *
+			 * the solution used here halts migration of this table until the
+			 * primary table becomes something besides @dst. interrupted
+			 * migration is noted in @src->mig_next, causing migrated rows to
+			 * possibly appear in ht_migrate_entry().
 			 */
 			atomic_fetch_sub_explicit(&dst->elems, 1, memory_order_relaxed);
-			dst = double_table(ht, dst, ptr);
-			if(dst == NULL) {
-				/* FIXME: doubling @dst here seems like a good idea, but the
-				 * malloc failure must be handled somehow. this is hard
-				 * because `mig_next' has already been decremented, meaning
-				 * that we've promised to move the entry out in some capacity.
-				 *
-				 * a simple solution would mark incomplete migration on this
-				 * table and retain it until total elems reaches zero, checked
-				 * in lfht_delval(). migration would resume into a different
-				 * primary table. with these, doubling here would be
-				 * unnecessary and ht_migrate_entry() could go back to being
-				 * the strictly reducing operation.
-				 *
-				 * for now, break apart and explode.
-				 */
-				abort();
-			}
-			goto dst_retry;
+			increase_to(&src->halt_gen_id, dst->gen_id);
+			increase_to(&src->mig_next, spos + 1);
+			/* skip this table; migration from somewhere else may succeed. */
+			return true;
 		}
 	}
 
@@ -476,21 +484,22 @@ dst_retry:
  */
 static void ht_migrate(struct lfht *ht, struct lfht_table *dst)
 {
-	struct lfht_table *sec = get_next(dst);
-	if(sec == NULL) return;		/* nothing to do! */
-
 	bool single = true;
+	struct lfht_table *sec = NULL, *next = dst;
 	for(;;) {
-		struct lfht_table *next = get_next(sec);
+		next = get_next(next);
 		if(next == NULL) break;
 		single = false;
-		sec = next;
+		unsigned long halt_gen = atomic_load_explicit(
+			&next->halt_gen_id, memory_order_relaxed);
+		if(halt_gen < dst->gen_id) sec = next;
 	}
+	if(sec == NULL) return;		/* nothing to do! */
 
 	int n_times = dst->size_log2 > sec->size_log2 && single ? 1 : 3;
 	for(int i=0; i < n_times; i++) {
 		if(ht_migrate_entry(ht, dst, sec) && n_times > 1) {
-			sec = next_table_gen(ht, sec);
+			sec = next_table_gen(ht, sec, true);
 			if(sec == NULL || sec == get_main(ht)) break;
 		}
 	}
@@ -658,7 +667,7 @@ static inline void lfht_iter_init(
  * NULL when @prev is @ht's main table.
  */
 static struct lfht_table *next_table_gen(
-	const struct lfht *ht, const struct lfht_table *prev)
+	const struct lfht *ht, const struct lfht_table *prev, bool filter_halted)
 {
 	unsigned long prev_gen = prev->gen_id;
 	struct lfht_table *t = NULL;
@@ -671,7 +680,11 @@ static struct lfht_table *next_table_gen(
 		if(cur == &prev->link) break;
 		struct lfht_table *cand = container_of(cur, struct lfht_table, link);
 		if(cand->gen_id <= prev_gen) break;
-		t = cand;
+		if(!filter_halted
+			|| atomic_load(&cand->halt_gen_id) < get_main(ht)->gen_id)
+		{
+			t = cand;
+		}
 	}
 
 	return t;
@@ -700,7 +713,7 @@ void *lfht_firstval(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 		if(val != NULL) return val;
 		else {
 			/* next table plz */
-			tab = next_table_gen(ht, it->t);
+			tab = next_table_gen(ht, it->t, false);
 			if(tab == NULL) return NULL;
 			lfht_iter_init(it, tab, hash);
 		}
@@ -726,7 +739,7 @@ void *lfht_nextval(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 
 	/* go to next table, etc. */
 	do {
-		struct lfht_table *tab = next_table_gen(ht, it->t);
+		struct lfht_table *tab = next_table_gen(ht, it->t, false);
 		if(tab == NULL) return NULL;
 		lfht_iter_init(it, tab, hash);
 		ptr = ht_val(ht, it, hash);

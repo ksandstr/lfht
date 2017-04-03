@@ -19,10 +19,16 @@ struct lfht_table
 {
 	struct nbsl_node link;	/* in <struct lfht>.tables */
 
-	/* consistent at `link' or `table' release */
+	/* consistent at `link' or `*table' release */
 	size_t elems, deleted;
-	/* monotonically decreasing */
+	/* monotonically decreasing.
+	 * mig_next can increase iff halt_gen_id > 0.
+	 */
 	_Atomic ssize_t mig_next, mig_left;
+	/* increase-only via cmpxchg.
+	 * halt migration if halt_gen_id >= main table's gen_id.
+	 */
+	_Atomic unsigned long halt_gen_id;
 
 	/* constants */
 	uintptr_t *table CACHELINE_ALIGN;	/* allocated separately */
