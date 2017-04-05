@@ -44,9 +44,30 @@ static bool str_in(struct lfht *ht, const char *str) {
 
 static char *gen_string(int thread_id, int seed)
 {
-	char buf[100];
-	snprintf(buf, sizeof(buf), "test-tid%02d-%04x", thread_id, seed);
-	return strdup(buf);
+	const size_t chunk_size = 64 * 1024;
+	static __thread char *buffer = NULL;
+	static __thread size_t bufsize, bufpos;
+
+	if(buffer == NULL) {
+		buffer = malloc(chunk_size);
+		if(buffer == NULL) {
+			diag("%s: malloc failed", __func__);
+			abort();
+		}
+		bufsize = chunk_size;
+		bufpos = 0;
+	}
+	bufpos = (bufpos + 7) & ~7ul;
+	size_t n = snprintf(&buffer[bufpos], bufsize - bufpos,
+		"test-tid%02d-%04x", thread_id, seed);
+	if(bufpos + n + 1 >= bufsize) {
+		buffer = NULL;
+		return gen_string(thread_id, seed);
+	} else {
+		size_t p = bufpos;
+		bufpos += n + 1;
+		return &buffer[p];
+	}
 }
 
 
@@ -86,7 +107,6 @@ static void *participant_fn(void *param_ptr)
 					diag("%d: didn't find `%s' at i=%d", thread_id, s, i);
 					found_delay = false;
 				}
-				free(s);
 			}
 		}
 		if((i % 239) == 0) {
