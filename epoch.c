@@ -14,10 +14,8 @@
 #include <ccan/container_of/container_of.h>
 
 #include "nbsl.h"
+#include "percpu.h"
 #include "epoch.h"
-
-
-#define GET_BUCKET() (&buckets[sched_getcpu() >> bucket_shift])
 
 
 struct e_client
@@ -53,56 +51,44 @@ struct e_bucket {
 	_Atomic unsigned long count[4];
 } __attribute__((aligned(64)));
 
+#define GET_BUCKET() ((struct e_bucket *)percpu_my(epoch_pc))
 
-static struct nbsl client_list = NBSL_LIST_INIT(client_list);
 
 static _Atomic unsigned long global_epoch = 2;
-
-static struct e_bucket *buckets = NULL;
-static int num_buckets = 0, bucket_shift = 0;
-
+static struct percpu *epoch_pc = NULL;
+static struct nbsl client_list = NBSL_LIST_INIT(client_list);
 static _Atomic bool global_init_flag = false;
+
+
+static void e_bucket_ctor(void *ptr)
+{
+	struct e_bucket *b = ptr;
+	for(int j=0; j < 4; j++) {
+		atomic_store_explicit(&b->dtor_list[j], NULL, memory_order_relaxed);
+		atomic_store_explicit(&b->count[j], 0, memory_order_relaxed);
+	}
+}
 
 
 static void ensure_global_init(void)
 {
-	/* try to figure out the proper setup. idea here is that from 8 threads
-	 * up, the system is likely to share highest-level caches between two
-	 * sibling CPUs. this is a total fudge, but until GUHNOO/Lynnocks starts
-	 * handing 'em out nicely, it'll do.
-	 */
-	int n_cpus = sysconf(_SC_NPROCESSORS_ONLN), zero = 0,
-		shift = n_cpus >= 8 ? 1 : 0;
-	if(!atomic_compare_exchange_strong(&bucket_shift, &zero, shift)) {
-		shift = zero;
-		zero = 0;
-	}
-	if(!atomic_compare_exchange_strong(&num_buckets,
-		&zero, n_cpus >> shift))
-	{
-		n_cpus = zero << shift;
-		zero = 0;
-	}
-
-	struct e_bucket *bks = aligned_alloc(alignof(*bks),
-		sizeof(*bks) * (n_cpus >> shift));
-	if(bks == NULL) {
-		fprintf(stderr, "epoch: %s: out of memory!\n", __func__);
-		abort();
-	}
-	for(int i=0; i < n_cpus >> shift; i++) {
-		for(int j=0; j < 4; j++) {
-			atomic_store_explicit(&bks[i].dtor_list[j], NULL,
-				memory_order_relaxed);
-			atomic_store_explicit(&bks[i].count[j], 0, memory_order_relaxed);
+	struct percpu *pc = percpu_new(sizeof(struct e_bucket), &e_bucket_ctor);
+	if(pc == NULL) {
+		if(atomic_load(&epoch_pc) == NULL) {
+			fprintf(stderr, "epoch: %s: out of memory!\n", __func__);
+			abort();
+		} else {
+			/* huh, who'd've thunk. */
+			return;
 		}
 	}
-	struct e_bucket *old = NULL;
-	if(!atomic_compare_exchange_strong_explicit(&buckets, &old, bks,
+
+	struct percpu *old = NULL;
+	if(!atomic_compare_exchange_strong_explicit(&epoch_pc, &old, pc,
 		memory_order_release, memory_order_relaxed))
 	{
 		assert(old != NULL);
-		free(bks);
+		percpu_free(pc);
 	}
 
 	atomic_store_explicit(&global_init_flag, true, memory_order_release);
@@ -164,12 +150,12 @@ static void tick(unsigned long old_epoch)
 		&oldval, new_epoch, memory_order_release, memory_order_relaxed);
 
 	/* starting from our own CPU, do each dtor list in turn. */
-	for(int base = sched_getcpu() >> bucket_shift, i = 0;
-		i < num_buckets;
+	for(int base = sched_getcpu() >> epoch_pc->shift, i = 0;
+		i < epoch_pc->n_buckets;
 		i++)
 	{
 		/* once-only is guaranteed by atomic exchange. */
-		struct e_bucket *bk = &buckets[base ^ i];
+		struct e_bucket *bk = percpu_get(epoch_pc, base ^ i);
 		atomic_store_explicit(&bk->count[(old_epoch - 2) & 3], 0,
 			memory_order_relaxed);
 		struct e_dtor_call *dead = atomic_exchange_explicit(
@@ -248,9 +234,12 @@ int e_begin(void)
 static size_t sum_counts(int e)
 {
 	size_t sum = 0;
-	for(int b = sched_getcpu() >> bucket_shift, i=0; i < num_buckets; i++) {
-		sum += atomic_load_explicit(&buckets[b ^ i].count[e],
-			memory_order_relaxed);
+	for(int b = sched_getcpu() >> epoch_pc->shift, i = 0;
+		i < epoch_pc->n_buckets;
+		i++)
+	{
+		struct e_bucket *bk = percpu_get(epoch_pc, b ^ i);
+		sum += atomic_load_explicit(&bk->count[e], memory_order_relaxed);
 	}
 	return sum;
 }
