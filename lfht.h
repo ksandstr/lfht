@@ -8,6 +8,7 @@
 #include <stdatomic.h>
 
 #include "nbsl.h"
+#include "percpu.h"
 
 
 #define LFHT_MIN_TABLE_SIZE 5	/* 32 entries = 2 cachelines on LP64 */
@@ -19,8 +20,6 @@ struct lfht_table
 {
 	struct nbsl_node link;	/* in <struct lfht>.tables */
 
-	/* consistent at `link' or `*table' release */
-	size_t elems, deleted;
 	/* monotonically decreasing.
 	 * mig_next can increase iff halt_gen_id > 0.
 	 */
@@ -32,6 +31,7 @@ struct lfht_table
 
 	/* constants */
 	uintptr_t *table CACHELINE_ALIGN;	/* allocated separately */
+	struct percpu *pc;			/* of <struct lfht_table_percpu> */
 	/* common_mask indicates bits that're the same across all keys;
 	 * common_bits specifies what those bits are. perfect_bit, when nonzero,
 	 * is always set in common_mask, and cleared in common_bits.
@@ -40,6 +40,13 @@ struct lfht_table
 	unsigned long gen_id;		/* next == NULL || gen_id > next->gen_id */
 	size_t max, max_with_deleted, max_probe;
 	unsigned int size_log2;		/* 1 << size_log2 < SSIZE_MAX */
+};
+
+
+struct lfht_table_percpu
+{
+	/* split-sum counters. consistent at `link' or `*table' release. */
+	size_t elems, deleted;
 };
 
 

@@ -5,6 +5,7 @@
 #include <stdatomic.h>
 #include <stdalign.h>
 #include <assert.h>
+#include <sched.h>
 
 #include <ccan/likely/likely.h>
 #include <ccan/container_of/container_of.h>
@@ -21,6 +22,10 @@
 #define MIN_PROBE (64 * 2 / sizeof(uintptr_t))
 
 #define POPCOUNT(x) __builtin_popcount((x))
+
+#define MY_PERCPU(t) ((struct lfht_table_percpu *)percpu_my((t)->pc))
+#define ELEMS(t) (MY_PERCPU((t))->elems)
+#define DELETED(t) (MY_PERCPU((t))->deleted)
 
 
 #define increase_to(ptr, val) do { \
@@ -108,6 +113,39 @@ static void set_bits(
 }
 
 
+static void table_percpu_ctor(void *ptr)
+{
+	struct lfht_table_percpu *pc = ptr;
+	pc->elems = 0;
+	pc->deleted = 0;
+}
+
+
+static void get_totals(
+	size_t *elems_p, size_t *deleted_p,
+	struct lfht_table *t)
+{
+	size_t e = 0, d = 0;
+	for(int base = sched_getcpu() >> t->pc->shift, i = 0;
+		i < t->pc->n_buckets;
+		i++)
+	{
+		struct lfht_table_percpu *pc = percpu_get(t->pc, base ^ i);
+		e += atomic_load_explicit(&pc->elems, memory_order_relaxed);
+		d += atomic_load_explicit(&pc->deleted, memory_order_relaxed);
+	}
+	*elems_p = e;
+	*deleted_p = d;
+}
+
+
+static inline size_t get_total_elems(struct lfht_table *t) {
+	size_t e, d;
+	get_totals(&e, &d, t);
+	return e;
+}
+
+
 /* FIXME: handle the case where gen_id wraps around by compressing gen_ids
  * from far up. this is rather unlikely to matter for now, but is absolutely
  * critical for multi-year stability, since rehashing will continue
@@ -121,13 +159,19 @@ static struct lfht_table *new_table(int sizelog2)
 		alignof(struct lfht_table), sizeof(*tab));
 	if(tab == NULL) return NULL;
 	tab->link.next = 0;
-	tab->elems = 0; tab->deleted = 0;
 	tab->mig_left = 1L << sizelog2;
 	tab->mig_next = (1L << sizelog2) - 1;
 	tab->size_log2 = sizelog2;
 	tab->gen_id = 0;
 	tab->table = calloc(1L << sizelog2, sizeof(uintptr_t));
 	if(tab->table == NULL) {
+		free(tab);
+		return NULL;
+	}
+	tab->pc = percpu_new(sizeof(struct lfht_table_percpu),
+		&table_percpu_ctor);
+	if(tab->pc == NULL) {
+		free(tab->table);
 		free(tab);
 		return NULL;
 	}
@@ -249,7 +293,8 @@ static struct lfht_table *rehash_table(
 
 static void table_dtor(struct lfht_table *tab)
 {
-	assert(tab->elems == 0);	/* should be stable by now. */
+	assert(get_total_elems(tab) == 0);	/* should be stable by now. */
+	percpu_free(tab->pc);
 	free(tab->table);
 	free(tab);
 }
@@ -327,7 +372,7 @@ static int ht_add(struct lfht_table *tab, const void *p, size_t hash)
 retry:
 			hval = make_hval(tab, p, get_hash_ptr_bits(tab, hash) | perfect);
 			if(e == LFHT_DELETED) {
-				atomic_fetch_sub_explicit(&tab->deleted, 1,
+				atomic_fetch_sub_explicit(&DELETED(tab), 1,
 					memory_order_relaxed);
 			}
 			uintptr_t old_e = e;
@@ -343,7 +388,7 @@ retry:
 				goto retry;
 			} else {
 				/* slot was snatched. undo and keep going. */
-				if(old_e == LFHT_DELETED) atomic_fetch_add(&tab->deleted, 1);
+				if(old_e == LFHT_DELETED) atomic_fetch_add(&DELETED(tab), 1);
 			}
 		}
 		i = (i + 1) & mask;
@@ -412,16 +457,18 @@ e_retry:
 			goto e_retry;
 		}
 	} else {
+		struct lfht_table_percpu *dst_pc, *src_pc;
 dst_retry:
-		atomic_fetch_add_explicit(&dst->elems, 1,
-			memory_order_relaxed);
+		dst_pc = MY_PERCPU(dst);
+		src_pc = MY_PERCPU(src);
+		atomic_fetch_add_explicit(&dst_pc->elems, 1, memory_order_relaxed);
 		void *ptr = get_raw_ptr(src, e);
 		size_t hash = (*ht->rehash_fn)(ptr, ht->priv);
 		int n = ht_add(dst, ptr, hash);
 		if(n == 0 && atomic_compare_exchange_strong_explicit(&src->table[spos],
 			&e, LFHT_NA_FULL, memory_order_relaxed, memory_order_relaxed))
 		{
-			atomic_fetch_sub_explicit(&src->elems, 1, memory_order_release);
+			atomic_fetch_sub_explicit(&src_pc->elems, 1, memory_order_release);
 		} else if(n == 0) {
 			/* deleted under our feet (or migrated, but that only happens if
 			 * migration from @src was previously halted). that's fine.
@@ -434,7 +481,7 @@ dst_retry:
 			goto e_retry;
 		} else if(n > 0) {
 			/* @dst was made secondary. refetch and try again. */
-			atomic_fetch_sub_explicit(&dst->elems, 1, memory_order_relaxed);
+			atomic_fetch_sub_explicit(&dst_pc->elems, 1, memory_order_relaxed);
 			struct lfht_table *rarest = get_main(ht);
 			assert(rarest != dst);
 			dst = rarest;
@@ -453,7 +500,7 @@ dst_retry:
 			 * migration is noted in @src->mig_next, causing migrated rows to
 			 * possibly appear in ht_migrate_entry().
 			 */
-			atomic_fetch_sub_explicit(&dst->elems, 1, memory_order_relaxed);
+			atomic_fetch_sub_explicit(&dst_pc->elems, 1, memory_order_relaxed);
 			increase_to(&src->halt_gen_id, dst->gen_id);
 			increase_to(&src->mig_next, spos + 1);
 			/* skip this table; migration from somewhere else may succeed. */
@@ -565,11 +612,14 @@ bool lfht_add(struct lfht *ht, size_t hash, void *p)
 		}
 	}
 
+	struct lfht_table_percpu *pc;
+
 retry:
-	atomic_fetch_add_explicit(&tab->elems, 1, memory_order_relaxed);
+	pc = MY_PERCPU(tab);
+	atomic_fetch_add_explicit(&pc->elems, 1, memory_order_relaxed);
 
 	if(((uintptr_t)p & tab->common_mask) != tab->common_bits) {
-		atomic_fetch_sub_explicit(&tab->elems, 1, memory_order_relaxed);
+		atomic_fetch_sub_explicit(&pc->elems, 1, memory_order_relaxed);
 		tab = remask_table(ht, tab, p);
 		if(tab == NULL) goto fail;
 		goto retry;
@@ -580,23 +630,24 @@ retry:
 		/* tab was made secondary and migration twilight reached where @hash
 		 * would land. undo and retry to avoid a further off-cpu migration.
 		 */
-		atomic_fetch_sub_explicit(&tab->elems, 1, memory_order_relaxed);
+		atomic_fetch_sub_explicit(&pc->elems, 1, memory_order_relaxed);
 		tab = get_main(ht);
 		goto retry;
 	} else if(n < 0) {
 		/* probe limit was reached. double or rehash the table. */
-		size_t elems = tab->elems, deleted = tab->deleted;
+		size_t elems, deleted;
+		get_totals(&elems, &deleted, tab);
 		if(elems + 1 <= tab->max
 			&& elems + 1 + deleted > tab->max_with_deleted)
 		{
 			struct lfht_table *oldtab = tab;
 			tab = rehash_table(ht, tab);
 			if(likely(tab != oldtab)) {
-				atomic_fetch_sub_explicit(&oldtab->elems, 1,
+				atomic_fetch_sub_explicit(&ELEMS(oldtab), 1,
 					memory_order_relaxed);
 			}
 		} else {
-			atomic_fetch_sub_explicit(&tab->elems, 1, memory_order_relaxed);
+			atomic_fetch_sub_explicit(&pc->elems, 1, memory_order_relaxed);
 			tab = double_table(ht, tab, p);
 			if(tab == NULL) goto fail;
 		}
@@ -625,8 +676,9 @@ bool lfht_delval(const struct lfht *ht, struct lfht_iter *it, void *p)
 			&it->t->table[it->off], &e, LFHT_DELETED,
 			memory_order_release, memory_order_relaxed))
 	{
-		atomic_fetch_add_explicit(&it->t->deleted, 1, memory_order_relaxed);
-		atomic_fetch_sub_explicit(&it->t->elems, 1, memory_order_relaxed);
+		struct lfht_table_percpu *pc = MY_PERCPU(it->t);
+		atomic_fetch_add_explicit(&pc->deleted, 1, memory_order_relaxed);
+		atomic_fetch_sub_explicit(&pc->elems, 1, memory_order_relaxed);
 		return true;
 	} else {
 		return false;
