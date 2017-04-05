@@ -113,19 +113,13 @@ static void set_bits(
 }
 
 
-static void table_percpu_ctor(void *ptr)
-{
-	struct lfht_table_percpu *pc = ptr;
-	pc->elems = 0;
-	pc->deleted = 0;
-}
-
-
 static void get_totals(
-	size_t *elems_p, size_t *deleted_p,
+	size_t *elems_p, size_t *deleted_p, size_t *mig_left_p,
 	struct lfht_table *t)
 {
+	atomic_thread_fence(memory_order_acquire);
 	size_t e = 0, d = 0;
+	ssize_t ml = 0;
 	for(int base = sched_getcpu() >> t->pc->shift, i = 0;
 		i < t->pc->n_buckets;
 		i++)
@@ -133,16 +127,27 @@ static void get_totals(
 		struct lfht_table_percpu *pc = percpu_get(t->pc, base ^ i);
 		e += atomic_load_explicit(&pc->elems, memory_order_relaxed);
 		d += atomic_load_explicit(&pc->deleted, memory_order_relaxed);
+		if(mig_left_p != NULL) {
+			ml += atomic_load_explicit(&pc->mig_left, memory_order_relaxed);
+		}
 	}
 	*elems_p = e;
 	*deleted_p = d;
+	if(mig_left_p != NULL) *mig_left_p = ml;
 }
 
 
 static inline size_t get_total_elems(struct lfht_table *t) {
 	size_t e, d;
-	get_totals(&e, &d, t);
+	get_totals(&e, &d, NULL, t);
 	return e;
+}
+
+
+static inline size_t get_total_mig_left(struct lfht_table *t) {
+	size_t e, d, ml;
+	get_totals(&e, &d, &ml, t);
+	return ml;
 }
 
 
@@ -159,8 +164,6 @@ static struct lfht_table *new_table(int sizelog2)
 		alignof(struct lfht_table), sizeof(*tab));
 	if(tab == NULL) return NULL;
 	tab->link.next = 0;
-	tab->mig_left = 1L << sizelog2;
-	tab->mig_next = (1L << sizelog2) - 1;
 	tab->size_log2 = sizelog2;
 	tab->gen_id = 0;
 	tab->table = calloc(1L << sizelog2, sizeof(uintptr_t));
@@ -168,8 +171,7 @@ static struct lfht_table *new_table(int sizelog2)
 		free(tab);
 		return NULL;
 	}
-	tab->pc = percpu_new(sizeof(struct lfht_table_percpu),
-		&table_percpu_ctor);
+	tab->pc = percpu_new(sizeof(struct lfht_table_percpu), NULL);
 	if(tab->pc == NULL) {
 		free(tab->table);
 		free(tab);
@@ -191,6 +193,24 @@ static struct lfht_table *new_table(int sizelog2)
 	tab->max_probe = (1ul << sizelog2) / 32;
 	if(tab->max_probe < MIN_PROBE) tab->max_probe = MIN_PROBE;
 
+	/* assign migration chunks. */
+	size_t remain = 1ul << sizelog2,
+		chunk = remain / tab->pc->n_buckets;
+	for(int i=0; i < tab->pc->n_buckets; i++) {
+		struct lfht_table_percpu *p = percpu_get(tab->pc, i);
+		p->mig_next = remain - 1;
+		if(i == tab->pc->n_buckets - 1) {
+			p->mig_left = remain;
+		} else {
+			assert(remain > chunk);
+			p->mig_left = chunk;
+		}
+		remain -= p->mig_left;
+		p->mig_last = remain;
+	}
+	assert(remain == 0);
+
+	atomic_thread_fence(memory_order_release);
 	return tab;
 }
 
@@ -425,6 +445,41 @@ static void *ht_val(
 }
 
 
+static ssize_t take_percpu_work(struct lfht_table_percpu *c)
+{
+	ssize_t next = atomic_load_explicit(&c->mig_next,
+		memory_order_relaxed);
+	while(next >= c->mig_last
+		&& !atomic_compare_exchange_weak(&c->mig_next, &next, next - 1))
+	{
+		/* spin */
+	}
+	return next < c->mig_last ? -1 : next;
+}
+
+
+static ssize_t take_mig_work(
+	bool *last_p,
+	struct lfht_table_percpu **pc_p,
+	struct lfht_table *src)
+{
+	ssize_t work = -1;
+	for(int base = sched_getcpu() >> src->pc->shift, i = 0;
+		i < src->pc->n_buckets && work < 0;
+		i++)
+	{
+		struct lfht_table_percpu *c = percpu_get(src->pc, base ^ i);
+		work = take_percpu_work(c);
+		if(work >= 0) {
+			*pc_p = c;
+			*last_p = (i == src->pc->n_buckets - 1);
+		}
+	}
+
+	return work;
+}
+
+
 /* check an entry in @src, migrate it to @dst (or @ht's main table) if valid.
  * returns true when @src became empty, was already empty, or migration was
  * blocked on it.
@@ -432,12 +487,15 @@ static void *ht_val(
 static bool ht_migrate_entry(
 	struct lfht *ht, struct lfht_table *dst, struct lfht_table *src)
 {
+	struct lfht_table_percpu *src_pc;
 	ssize_t spos;
+	bool last_chunk;
 spos_retry:
-	spos = atomic_fetch_sub_explicit(&src->mig_next, 1, memory_order_acquire);
+	spos = take_mig_work(&last_chunk, &src_pc, src);
 	if(spos < 0) return true;
 
-	uintptr_t e = atomic_load_explicit(&src->table[spos], memory_order_relaxed);
+	uintptr_t e = atomic_load_explicit(&src->table[spos],
+		memory_order_relaxed);
 e_retry:
 	if(!entry_is_avail(e)) {
 		/* in a table where migration was previously halted, non-available
@@ -457,10 +515,9 @@ e_retry:
 			goto e_retry;
 		}
 	} else {
-		struct lfht_table_percpu *dst_pc, *src_pc;
+		struct lfht_table_percpu *dst_pc;
 dst_retry:
 		dst_pc = MY_PERCPU(dst);
-		src_pc = MY_PERCPU(src);
 		atomic_fetch_add_explicit(&dst_pc->elems, 1, memory_order_relaxed);
 		void *ptr = get_raw_ptr(src, e);
 		size_t hash = (*ht->rehash_fn)(ptr, ht->priv);
@@ -502,17 +559,18 @@ dst_retry:
 			 */
 			atomic_fetch_sub_explicit(&dst_pc->elems, 1, memory_order_relaxed);
 			increase_to(&src->halt_gen_id, dst->gen_id);
-			increase_to(&src->mig_next, spos + 1);
+			increase_to(&src_pc->mig_next, spos + 1);
 			/* skip this table; migration from somewhere else may succeed. */
 			return true;
 		}
 	}
 
-	if(atomic_fetch_sub_explicit(&src->mig_left, 1,
-		memory_order_relaxed) == 1)
+	if(atomic_fetch_sub_explicit(&src_pc->mig_left, 1,
+			memory_order_relaxed) == 1
+		&& (last_chunk || get_total_mig_left(src) == 0))
 	{
 		/* migration has emptied the table. it can now be removed. */
-		assert(src->mig_next <= 0 || src->halt_gen_id > 0);
+		assert(src_pc->mig_next < src_pc->mig_last || src->halt_gen_id > 0);
 		remove_table(ht, src);
 		return true;
 	} else {
@@ -636,7 +694,7 @@ retry:
 	} else if(n < 0) {
 		/* probe limit was reached. double or rehash the table. */
 		size_t elems, deleted;
-		get_totals(&elems, &deleted, tab);
+		get_totals(&elems, &deleted, NULL, tab);
 		if(elems + 1 <= tab->max
 			&& elems + 1 + deleted > tab->max_with_deleted)
 		{

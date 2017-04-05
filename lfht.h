@@ -20,10 +20,6 @@ struct lfht_table
 {
 	struct nbsl_node link;	/* in <struct lfht>.tables */
 
-	/* monotonically decreasing.
-	 * mig_next can increase iff halt_gen_id > 0.
-	 */
-	_Atomic ssize_t mig_next, mig_left;
 	/* increase-only via cmpxchg.
 	 * halt migration if halt_gen_id >= main table's gen_id.
 	 */
@@ -47,6 +43,12 @@ struct lfht_table_percpu
 {
 	/* split-sum counters. consistent at `link' or `*table' release. */
 	size_t elems, deleted;
+
+	/* monotonically decreasing.
+	 * mig_next can increase iff halt_gen_id > 0.
+	 */
+	_Atomic ssize_t mig_next, mig_left;
+	ssize_t mig_last;
 };
 
 
