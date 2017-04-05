@@ -107,7 +107,7 @@ static void clear_flag(struct nbsl_node *prev, struct nbsl_node *n)
 bool nbsl_push(struct nbsl *list, struct nbsl_node *top, struct nbsl_node *n)
 {
 	assert(((uintptr_t)n & F__MASK) == 0);
-	uintptr_t old = atomic_load_explicit(&list->n.next, memory_order_consume);
+	uintptr_t old = atomic_load_explicit(&list->n.next, memory_order_acquire);
 	while((old & F_FLAG) != 0) {
 		clear_flag(&list->n, n_ptr(old));
 		old = atomic_load(&list->n.next);
@@ -150,7 +150,7 @@ struct nbsl_node *nbsl_pop(struct nbsl *list)
 
 
 struct nbsl_node *nbsl_top(const struct nbsl *list) {
-	return n_ptr(atomic_load_explicit(&list->n.next, memory_order_consume));
+	return n_ptr(atomic_load_explicit(&list->n.next, memory_order_acquire));
 }
 
 
@@ -204,7 +204,7 @@ struct nbsl_node *nbsl_first(const struct nbsl *list, struct nbsl_iter *it)
 {
 	it->prev = (struct nbsl_node *)&list->n;
 	it->cur = n_ptr(atomic_load_explicit(&list->n.next,
-		memory_order_consume));
+		memory_order_acquire));
 	return skip_dead_nodes(it);
 }
 
@@ -228,7 +228,7 @@ bool nbsl_del_at(struct nbsl *list, struct nbsl_iter *it)
 	if((cur_val & F_MARK) != 0) return false;	/* already gone */
 
 	struct nbsl_node *p = it->prev;
-	uintptr_t p_val = atomic_load_explicit(&p->next, memory_order_consume);
+	uintptr_t p_val = atomic_load_explicit(&p->next, memory_order_acquire);
 	bool got = try_flag(&p, p_val, it->cur);
 	it->prev = NULL;
 	if(p != NULL) clear_flag(p, it->cur);

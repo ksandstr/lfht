@@ -267,7 +267,7 @@ void e_end(int cookie)
 		 */
 		bool deep = (++c->count_since_tick & 0x1f) == 0;
 		unsigned long epoch = atomic_load_explicit(&global_epoch,
-			memory_order_consume);
+			memory_order_acquire);
 		assert(epoch == c->epoch || epoch == next_epoch(c->epoch));
 		if(GET_BUCKET()->count[epoch & 3] > 0
 			|| (deep && sum_counts(epoch & 3) > 0))
@@ -302,7 +302,7 @@ void _e_call_dtor(void (*dtor_fn)(void *ptr), void *ptr)
 	call->dtor_fn = dtor_fn;
 	call->ptr = ptr;
 	unsigned long epoch = atomic_load_explicit(&global_epoch,
-		memory_order_consume);
+		memory_order_acquire);
 	struct e_bucket *bk = GET_BUCKET();
 	struct e_dtor_call *_Atomic *head = &bk->dtor_list[epoch & 3];
 	do {

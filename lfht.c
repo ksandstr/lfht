@@ -389,7 +389,7 @@ static bool ht_migrate_entry(
 {
 	ssize_t spos;
 spos_retry:
-	spos = atomic_fetch_sub_explicit(&src->mig_next, 1, memory_order_consume);
+	spos = atomic_fetch_sub_explicit(&src->mig_next, 1, memory_order_acquire);
 	if(spos < 0) return true;
 
 	uintptr_t e = atomic_load_explicit(&src->table[spos], memory_order_relaxed);
