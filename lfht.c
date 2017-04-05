@@ -423,9 +423,11 @@ dst_retry:
 		{
 			atomic_fetch_sub_explicit(&src->elems, 1, memory_order_release);
 		} else if(n == 0) {
-			/* deleted under our feet. that's fine. */
-			assert(!entry_is_valid(e));
-			assert(entry_is_avail(e));
+			/* deleted under our feet (or migrated, but that only happens if
+			 * migration from @src was previously halted). that's fine.
+			 */
+			assert(!entry_is_valid(e) || src->halt_gen_id > 0);
+			assert(entry_is_avail(e) || src->halt_gen_id > 0);
 			/* drop the extra item from wherever it wound up at. */
 			bool ok = lfht_del(ht, hash, ptr);
 			assert(ok);
