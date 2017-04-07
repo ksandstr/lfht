@@ -487,6 +487,10 @@ static ssize_t take_mig_work(
 static bool ht_migrate_entry(
 	struct lfht *ht, struct lfht_table *dst, struct lfht_table *src)
 {
+	assert(src != dst);
+	assert(POPCOUNT(dst->common_mask) <= POPCOUNT(src->common_mask));
+	assert(src->gen_id < dst->gen_id);
+
 	struct lfht_table_percpu *src_pc;
 	ssize_t spos;
 	bool last_chunk;
@@ -607,7 +611,12 @@ static void ht_migrate(struct lfht *ht, struct lfht_table *dst)
 	for(int i=0; i < n_times; i++) {
 		if(ht_migrate_entry(ht, dst, sec) && n_times > 1) {
 			sec = next_table_gen(ht, sec, true);
-			if(sec == NULL || sec == get_main(ht)) break;
+			if(sec == NULL || sec->gen_id >= dst->gen_id) {
+				assert(sec == NULL
+					|| sec->gen_id > dst->gen_id
+					|| sec == dst);
+				break;
+			}
 		}
 	}
 }
@@ -789,7 +798,6 @@ static struct lfht_table *next_table_gen(
 		cur != NULL;
 		cur = nbsl_next(&ht->tables, &it))
 	{
-		if(cur == &prev->link) break;
 		struct lfht_table *cand = container_of(cur, struct lfht_table, link);
 		if(cand->gen_id <= prev_gen) break;
 		if(!filter_halted
