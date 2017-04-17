@@ -116,16 +116,11 @@ static void set_bits(
 			tab->common_mask &= ~new;
 			tab->common_bits &= ~new;
 			assert((m & tab->common_mask) == tab->common_bits);
-			assert((tab->common_bits & ~tab->common_mask) == 0);
-			if(tab->perfect_bit != 0
-				&& ((tab->perfect_bit & tab->common_mask) == 0
-					|| (tab->perfect_bit & tab->common_bits) != 0))
-			{
-				tab->perfect_bit = get_perfect_bit(tab);
-			}
+			tab->perfect_bit = get_perfect_bit(tab);
 		}
 	}
 
+	assert((tab->common_bits & ~tab->common_mask) == 0);
 	assert(model == NULL
 		|| ((uintptr_t)model & tab->common_mask) == tab->common_bits);
 
