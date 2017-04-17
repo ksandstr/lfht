@@ -532,8 +532,8 @@ e_retry:
 			&e, new, memory_order_release, memory_order_relaxed))
 		{
 			/* a concurrent ht_add() filled it in. try again. */
-			assert(entry_is_valid(e));
-			assert(entry_is_avail(e));
+			assert(entry_is_avail(e));	/* single work assignment property */
+			assert(entry_is_valid(e) || e == LFHT_DELETED);
 			goto e_retry;
 		}
 	} else {
