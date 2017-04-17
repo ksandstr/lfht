@@ -88,13 +88,18 @@ static uintptr_t get_perfect_bit(const struct lfht_table *tab)
 
 
 static void set_bits(
-	struct lfht_table *tab, const struct lfht_table *prev, void *model)
+	int first_size_log2,
+	struct lfht_table *tab, const struct lfht_table *prev,
+	void *model)
 {
 	if(prev == NULL) {
-		/* punch MIN_SIZE_LOG2 - 1 bits' worth of holes in the common mask
-		 * above typical malloc grain of 32 bytes.
+		/* punch the initial size's worth of holes in the common mask above
+		 * a typical malloc grain of 32 bytes.
 		 */
-		tab->common_mask = (~(uintptr_t)0 << (MIN_SIZE_LOG2 + 4)) | 0x1f;
+		if(first_size_log2 < MIN_SIZE_LOG2 + 4) {
+			first_size_log2 = MIN_SIZE_LOG2 + 4;
+		}
+		tab->common_mask = (~(uintptr_t)0 << first_size_log2) | 0x1f;
 		assert(model != NULL);
 		tab->common_bits = (uintptr_t)model & tab->common_mask;
 		tab->perfect_bit = get_perfect_bit(tab);
@@ -245,7 +250,7 @@ static struct lfht_table *remask_table(
 	if(nt == NULL) return NULL;
 
 	for(;;) {
-		set_bits(nt, tab, model);
+		set_bits(0, nt, tab, model);
 		nt->gen_id = tab->gen_id + 1;
 		if(nbsl_push(&ht->tables, &tab->link, &nt->link)) {
 			/* i won! i won! */
@@ -283,7 +288,7 @@ static struct lfht_table *double_table(
 	if(nt == NULL) return NULL;
 
 	for(;;) {
-		set_bits(nt, tab, model);
+		set_bits(0, nt, tab, model);
 		nt->gen_id = tab->gen_id + 1;
 		if(nbsl_push(&ht->tables, &tab->link, &nt->link)) return nt;
 		tab = get_main(ht);
@@ -317,7 +322,7 @@ static struct lfht_table *rehash_table(
 {
 	struct lfht_table *nt = new_table(tab->size_log2);
 	if(nt == NULL) return tab;
-	set_bits(nt, tab, NULL);
+	set_bits(0, nt, tab, NULL);
 	nt->gen_id = tab->gen_id + 1;
 	if(nbsl_push(&ht->tables, &tab->link, &nt->link)) tab = nt;
 	else {
@@ -689,7 +694,7 @@ bool lfht_add(struct lfht *ht, size_t hash, void *p)
 	if(unlikely(tab == NULL)) {
 		tab = new_table(ht->first_size_log2);
 		if(tab == NULL) goto fail;
-		set_bits(tab, NULL, p);
+		set_bits(ht->first_size_log2, tab, NULL, p);
 		if(!nbsl_push(&ht->tables, NULL, &tab->link)) {
 			free(tab->table);
 			free(tab);
