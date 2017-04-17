@@ -64,12 +64,14 @@ static inline struct lfht_table *get_next(const struct lfht_table *tab) {
 }
 
 
-static uintptr_t get_perfect_bit(uintptr_t mask)
+static uintptr_t get_perfect_bit(const struct lfht_table *tab)
 {
 	/* deviate from CCAN htable by preferring very high-order bits. */
 	for(int i = sizeof(uintptr_t) * 8 - 1; i >= 0; i--) {
 		uintptr_t try = (uintptr_t)1 << i;
-		if((mask & try) != 0) return try;
+		if((tab->common_mask & try) != 0 && (tab->common_bits & try) == 0) {
+			return try;
+		}
 	}
 	return 0;
 }
@@ -83,9 +85,9 @@ static void set_bits(
 		 * above typical malloc grain of 32 bytes.
 		 */
 		tab->common_mask = (~(uintptr_t)0 << (MIN_SIZE_LOG2 + 4)) | 0x1f;
-		tab->perfect_bit = get_perfect_bit(tab->common_mask);
 		assert(model != NULL);
 		tab->common_bits = (uintptr_t)model & tab->common_mask;
+		tab->perfect_bit = get_perfect_bit(tab);
 	} else {
 		tab->common_mask = prev->common_mask;
 		tab->common_bits = prev->common_bits;
@@ -100,16 +102,22 @@ static void set_bits(
 			tab->common_bits &= ~new;
 			assert((m & tab->common_mask) == tab->common_bits);
 			assert((tab->common_bits & ~tab->common_mask) == 0);
-			if((tab->perfect_bit & tab->common_mask) == 0) {
-				tab->perfect_bit = get_perfect_bit(tab->common_mask);
+			if(tab->perfect_bit != 0
+				&& ((tab->perfect_bit & tab->common_mask) == 0
+					|| (tab->perfect_bit & tab->common_bits) != 0))
+			{
+				tab->perfect_bit = get_perfect_bit(tab);
 			}
 		}
 	}
+
 	assert(model == NULL
 		|| ((uintptr_t)model & tab->common_mask) == tab->common_bits);
+
+	assert(POPCOUNT(tab->perfect_bit) <= 1);
 	assert(tab->perfect_bit == 0
 		|| (tab->perfect_bit & tab->common_mask) != 0);
-	assert(POPCOUNT(tab->perfect_bit) <= 1);
+	assert((tab->perfect_bit & tab->common_bits) == 0);
 }
 
 
