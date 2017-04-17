@@ -22,6 +22,7 @@
 #define MIN_PROBE (64 * 2 / sizeof(uintptr_t))
 
 #define POPCOUNT(x) __builtin_popcount((x))
+#define MSB(x) (sizeof((x)) * 8 - __builtin_clzl((x)) - 1)
 
 #define MY_PERCPU(t) ((struct lfht_table_percpu *)percpu_my((t)->pc))
 #define ELEMS(t) (MY_PERCPU((t))->elems)
@@ -66,14 +67,23 @@ static inline struct lfht_table *get_next(const struct lfht_table *tab) {
 
 static uintptr_t get_perfect_bit(const struct lfht_table *tab)
 {
-	/* deviate from CCAN htable by preferring very high-order bits. */
+	/* deviate from CCAN htable by preferring very high-order bits. could
+	 * replace MSB() with ffsl(avail) - 1 to do the opposite, but why bother?
+	 */
+	uintptr_t avail = tab->common_mask & ~tab->common_bits,
+		fast = unlikely(avail == 0) ? 0 : (uintptr_t)1 << MSB(avail);
+
+#ifndef NDEBUG
+	uintptr_t try;
 	for(int i = sizeof(uintptr_t) * 8 - 1; i >= 0; i--) {
-		uintptr_t try = (uintptr_t)1 << i;
+		try = (uintptr_t)1 << i;
 		if((tab->common_mask & try) != 0 && (tab->common_bits & try) == 0) {
-			return try;
+			break;
 		}
 	}
-	return 0;
+	assert(fast == 0 || fast == try);
+#endif
+	return fast;
 }
 
 
