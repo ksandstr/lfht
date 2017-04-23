@@ -29,13 +29,44 @@ struct lfht_table
 	uintptr_t *table CACHELINE_ALIGN;	/* allocated separately */
 	struct percpu *pc;			/* of <struct lfht_table_percpu> */
 	/* common_mask indicates bits that're the same across all keys;
-	 * common_bits specifies what those bits are. perfect_bit, when nonzero,
-	 * is always set in common_mask, and cleared in common_bits.
+	 * common_bits specifies what those bits are.
+	 *
+	 * the *_bit fields are reserved bits, which are either set in common_mask
+	 * and resv_mask or themselves zero. their positions are never used to
+	 * store match bits derived from the hash value.
 	 */
-	uintptr_t common_mask, common_bits, perfect_bit;
+	uintptr_t common_mask, common_bits, resv_mask;
+	uintptr_t perfect_bit;
+
+	/* migration state bits. the interesting part.
+	 *
+	 * src_bit is set in a migration source entry until the state of the
+	 * source half is resolved to either successful migration or concurrent
+	 * deletion. it is exclusive with ephem_bit.
+	 *
+	 * del_bit marks late deletion in a migration source or ephemeral target
+	 * entry when concurrent deletion finds that src_bit was set, or ephem_bit
+	 * was set and a corresponding migration pointer was found.
+	 *
+	 * ephem_bit is set in a migration target entry before the migration is
+	 * confirmed successful.
+	 *
+	 * mig_bit is set in entries that've been migrated. it designates an
+	 * independent subformat where mig_bit is set and other bits are used for
+	 * a 10-bit gen_id offset and the other 21/53 for a probe address, or
+	 * post-migration tombstone values when gen_id=0. the low-level details
+	 * are documented in lfht.c .
+	 *
+	 * hazard_bit is set in slots that're subject to a potential ABBA race if
+	 * an entry with equal value were migrated in. ht_add() will skip slots
+	 * with hazard_bit set when the incoming entry has ephem_bit set.
+	 */
+	uintptr_t ephem_bit, src_bit, del_bit, mig_bit, hazard_bit;
+
 	unsigned long gen_id;		/* next == NULL || gen_id > next->gen_id */
 	size_t max, max_with_deleted, max_probe;
-	unsigned int size_log2;		/* 1 << size_log2 < SSIZE_MAX */
+	unsigned short size_log2;	/* 1 << size_log2 < SSIZE_MAX */
+	unsigned short probe_addr_size_log2;
 };
 
 
@@ -88,7 +119,7 @@ extern bool lfht_del(struct lfht *ht, size_t hash, const void *p);
  */
 struct lfht_iter {
 	struct lfht_table *t;
-	size_t off, end;
+	size_t off, end, hash;
 	uintptr_t perfect;
 };
 

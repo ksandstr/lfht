@@ -1,11 +1,15 @@
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <stdalign.h>
+#include <string.h>
+#include <limits.h>
 #include <assert.h>
 #include <sched.h>
+#include <errno.h>
 
 #include <ccan/likely/likely.h>
 #include <ccan/container_of/container_of.h>
@@ -13,10 +17,6 @@
 #include "lfht.h"
 #include "epoch.h"
 
-
-#define LFHT_DELETED (uintptr_t)1
-#define LFHT_NA_FULL (~(uintptr_t)0)
-#define LFHT_NA_EMPTY (LFHT_NA_FULL & ~(uintptr_t)1)
 
 #define MIN_SIZE_LOG2 LFHT_MIN_TABLE_SIZE
 #define MIN_PROBE (64 * 2 / sizeof(uintptr_t))
@@ -42,13 +42,114 @@ static struct lfht_table *next_table_gen(
 	const struct lfht *ht, const struct lfht_table *prev, bool filter_halted);
 
 
-static inline bool entry_is_valid(uintptr_t e) {
-	return e > LFHT_DELETED;
+#ifndef NDEBUG
+/* TODO: decode the migration pointer format as well */
+static inline char *format_entry(
+	char tmp[static 100], struct lfht_table *t, uintptr_t e)
+{
+	snprintf(tmp, 100, "%#lx [%c%c%c%c%c]", e,
+		(e & t->src_bit) != 0 ? 's' : '-',
+		(e & t->mig_bit) != 0 ? 'M' : '-',
+		(e & t->hazard_bit) != 0 ? 'h' : '-',
+		(e & t->ephem_bit) != 0 ? 'e' : '-',
+		(e & t->del_bit) != 0 ? 'D' : '-');
+	return tmp;
+}
+#endif
+
+
+/* true if @e (from @t->table) terminates probing. */
+static inline bool is_void(const struct lfht_table *t, uintptr_t e) {
+	return (e & ~t->mig_bit) == 0;
 }
 
 
-static inline bool entry_is_avail(uintptr_t e) {
-	return e != LFHT_NA_FULL && e != LFHT_NA_EMPTY;
+/* true if @e (from @t->table) is a valid slot for ht_add(). */
+static inline bool is_empty(const struct lfht_table *t, uintptr_t e) {
+	return (e & ~(t->del_bit | t->hazard_bit)) == 0;
+}
+
+
+/* true if @e (from @t->table) represents a value given in lfht_add(). */
+static inline bool is_val(const struct lfht_table *t, uintptr_t e) {
+	return !is_void(t, e) && (e & (t->del_bit | t->mig_bit)) == 0;
+}
+
+
+/* special values of the mig_bit format. */
+static inline uintptr_t mig_void(const struct lfht_table *t) {
+	assert(is_void(t, t->mig_bit));
+	assert(!is_val(t, t->mig_bit));
+	return t->mig_bit;
+}
+
+
+static inline uintptr_t mig_val(const struct lfht_table *t) {
+	uintptr_t e = (t->mig_bit + 1) | t->mig_bit;
+	assert(!is_void(t, e));
+	assert(!is_val(t, e));
+	return e;
+}
+
+
+/* decode the target gen_id for @e found in @t->table[]. */
+static inline unsigned long mig_gen_id(
+	const struct lfht_table *t, uintptr_t e)
+{
+	assert((e & t->mig_bit) != 0);
+	e = (e & (t->mig_bit - 1)) | ((e >> 1) & ~(t->mig_bit - 1));
+	return t->gen_id + (e & 0x3ff);
+}
+
+
+/* decode the slot index in @dst->table[] designated by migration pointer @e
+ * in source table @src, for an entry that hashes to @hash.
+ */
+static inline size_t mig_slot(
+	const struct lfht_table *src, size_t hash, uintptr_t e,
+	const struct lfht_table *dst)
+{
+	/* unpack around @src->mig_bit, discard gen_id. */
+	assert((e & src->mig_bit) != 0);
+	e = (e & (src->mig_bit - 1)) | ((e >> 1) & ~(src->mig_bit - 1));
+	uintptr_t addr = e >> 10;
+
+	/* combine hash, overflow bit, and the position in @e. */
+	uintptr_t dst_mask = (1ul << dst->size_log2) - 1,
+		bit = 1ul << dst->probe_addr_size_log2,
+		slot = (addr & ~bit) | ((hash + (addr & bit)) & ~(bit - 1) & dst_mask);
+	assert((slot & ~dst_mask) == 0);	/* unused bits are 0 in `addr' */
+
+	return slot;
+}
+
+
+/* compute the correct probe_addr parameter to mig_ptr(). the address will
+ * reference @dpos within @dst, which must be within @dst->max_probe slots of
+ * the initial position given by @hash.
+ *
+ * the format consists of @dst->probe_addr_size_log2 bits of @dpos and an
+ * overflow bit after it. mig_slot() adds the overflow bit's value to @hash
+ * before bits from it are injected to form a slot number.
+ */
+static inline uintptr_t probe_addr(
+	size_t dpos, size_t hash, struct lfht_table *dst)
+{
+	uintptr_t bit = 1ul << dst->probe_addr_size_log2;
+	return ((dpos & bit) != (hash & bit) ? bit : 0) | (dpos & (bit - 1));
+}
+
+
+static inline uintptr_t mig_ptr(
+	const struct lfht_table *t,
+	unsigned long ref_gen_id, uintptr_t probe_addr)
+{
+	assert(ref_gen_id > t->gen_id);
+	uintptr_t raw = (ref_gen_id - t->gen_id) | (probe_addr << 10),
+		e = t->mig_bit | (raw & (t->mig_bit - 1))
+			| (raw & ~(t->mig_bit - 1)) << 1;
+	assert(mig_gen_id(t, e) == ref_gen_id);
+	return e;
 }
 
 
@@ -63,12 +164,67 @@ static inline struct lfht_table *get_next(const struct lfht_table *tab) {
 }
 
 
-static inline uintptr_t get_perfect_bit(const struct lfht_table *tab)
+static void mig_deref(
+	const struct lfht *ht, size_t hash,
+	struct lfht_table **tab_p, size_t *pos_p, uintptr_t *val_p,
+	uintptr_t migptr)
+{
+	assert(mig_gen_id(*tab_p, migptr) > 0);
+	unsigned long gen_id = mig_gen_id(*tab_p, migptr);
+	struct lfht_table *cand = get_main(ht);
+	while(cand != NULL && cand->gen_id > gen_id) {
+		cand = get_next(cand);
+	}
+	assert(cand != NULL);
+	assert(cand->gen_id == gen_id);
+
+	size_t pos = mig_slot(*tab_p, hash, migptr, cand);
+	assert(pos >= 0 && pos < (1ul << cand->size_log2));
+	*tab_p = cand;
+	*pos_p = pos;
+	*val_p = atomic_load_explicit(&cand->table[pos], memory_order_relaxed);
+	assert(is_val(cand, *val_p)
+		|| (*val_p & cand->mig_bit) != 0
+		|| (*val_p & cand->del_bit) != 0);
+}
+
+
+static inline uintptr_t take_bit(uintptr_t *set)
 {
 	/* deviate from CCAN htable by preferring very high-order bits. could
-	 * replace MSB(...) with ffsl(...) - 1 to do the opposite, but why bother?
+	 * replace MSB(*set) with ffsl(*set) - 1 to do the opposite, but why
+	 * bother?
 	 */
-	return tab->common_mask == 0 ? 0 : (uintptr_t)1 << MSB(tab->common_mask);
+	assert(*set != 0);
+	uintptr_t v = (uintptr_t)1 << MSB(*set);
+	assert((*set & v) != 0);
+	*set &= ~v;
+	return v;
+}
+
+
+static void set_resv_bits(struct lfht_table *tab)
+{
+	uintptr_t cm = tab->common_mask;
+	if(likely(POPCOUNT(cm) >= 5)) {
+		tab->ephem_bit = take_bit(&cm);
+		tab->src_bit = take_bit(&cm);
+		tab->del_bit = take_bit(&cm);
+		tab->mig_bit = take_bit(&cm);
+		tab->hazard_bit = take_bit(&cm);
+	} else {
+		/* FIXME: the ugly fix for this involves making up all new common_mask
+		 * and common_bits, for an equal-sized main table as the previous, but
+		 * with 5 or 6 bits to spare. this'd use allocated storage to keep
+		 * combinations of keys that have no common bits, and require some
+		 * adjustments to the migration algorithm. so for now let's leave it
+		 * in a "tests don't hit it" condition.
+		 */
+		assert("migration requires 5 special bits (FIXME)" == NULL);
+	}
+	tab->perfect_bit = cm != 0 ? take_bit(&cm) : 0;
+	tab->resv_mask = tab->perfect_bit | tab->ephem_bit | tab->src_bit
+		| tab->del_bit | tab->mig_bit | tab->hazard_bit;
 }
 
 
@@ -87,21 +243,29 @@ static void set_bits(
 		tab->common_mask = (~(uintptr_t)0 << first_size_log2) | 0x1f;
 		assert(model != NULL);
 		tab->common_bits = (uintptr_t)model & tab->common_mask;
-		tab->perfect_bit = get_perfect_bit(tab);
+		set_resv_bits(tab);
 	} else {
 		tab->common_mask = prev->common_mask;
 		tab->common_bits = prev->common_bits;
-		assert(POPCOUNT(prev->perfect_bit) <= 1);
-		tab->perfect_bit = prev->perfect_bit;
 
 		uintptr_t m = (uintptr_t)model;
 		if(model != NULL && (m & tab->common_mask) != tab->common_bits) {
+			/* reduce common_mask, recompute reserved bits. */
 			uintptr_t new = tab->common_bits ^ (m & tab->common_mask);
 			assert((new & tab->common_mask) != 0);
 			tab->common_mask &= ~new;
 			tab->common_bits &= ~new;
 			assert((m & tab->common_mask) == tab->common_bits);
-			tab->perfect_bit = get_perfect_bit(tab);
+			set_resv_bits(tab);
+		} else {
+			/* inherit reserved bits. */
+			tab->resv_mask = prev->resv_mask;
+			tab->perfect_bit = prev->perfect_bit;
+			tab->ephem_bit = prev->ephem_bit;
+			tab->src_bit = prev->src_bit;
+			tab->del_bit = prev->del_bit;
+			tab->mig_bit = prev->mig_bit;
+			tab->hazard_bit = prev->hazard_bit;
 		}
 	}
 
@@ -109,9 +273,14 @@ static void set_bits(
 	assert(model == NULL
 		|| ((uintptr_t)model & tab->common_mask) == tab->common_bits);
 
+	/* (could check the same about the other reserved bits, but meh.) */
 	assert(POPCOUNT(tab->perfect_bit) <= 1);
 	assert(tab->perfect_bit == 0
 		|| (tab->perfect_bit & tab->common_mask) != 0);
+
+	assert(POPCOUNT(tab->resv_mask) == 5 || POPCOUNT(tab->resv_mask) == 6);
+	assert((tab->common_mask & tab->resv_mask) == tab->resv_mask);
+	assert(POPCOUNT(tab->resv_mask) <= POPCOUNT(tab->common_mask));
 }
 
 
@@ -194,6 +363,9 @@ static struct lfht_table *new_table(int sizelog2)
 	 */
 	tab->max_probe = (1ul << sizelog2) / 32;
 	if(tab->max_probe < MIN_PROBE) tab->max_probe = MIN_PROBE;
+	tab->probe_addr_size_log2 = ffsl(tab->max_probe * 3) + 1;
+	assert((1ul << tab->probe_addr_size_log2) >= tab->max_probe * 3);
+	assert(tab->probe_addr_size_log2 <= sizeof(uintptr_t) * 8 - 11);
 
 	/* assign migration chunks. */
 	size_t remain = 1ul << sizelog2,
@@ -292,7 +464,7 @@ static struct lfht_table *double_table(
 }
 
 
-/* install a new table of exactly the same size. ht_add() will migrate two
+/* install a new table of exactly the same size. lfht_add() will migrate two
  * items at a time while the new table remains @ht's main table. if malloc
  * fails, return @tab; if switching fails, return the new table.
  */
@@ -315,7 +487,7 @@ static struct lfht_table *rehash_table(
 
 static void table_dtor(struct lfht_table *tab)
 {
-	assert(get_total_elems(tab) == 0);	/* should be stable by now. */
+	assert(get_total_elems(tab) == 0);
 	percpu_free(tab->pc);
 	free(tab->table);
 	free(tab);
@@ -334,7 +506,6 @@ static void remove_table(struct lfht *ht, struct lfht_table *tab)
 static inline uintptr_t make_hval(
 	const struct lfht_table *tab, const void *p, uintptr_t bits)
 {
-	assert(entry_is_valid((uintptr_t)p));
 	return ((uintptr_t)p & ~tab->common_mask) | bits;
 }
 
@@ -349,14 +520,14 @@ static inline uintptr_t get_hash_ptr_bits(
 	 */
 	int n = tab->size_log2 + 4;
 	return (hash ^ ((hash >> n) | (hash << (sizeof(hash) * 8 - n))))
-		& tab->common_mask & ~tab->perfect_bit;
+		& tab->common_mask & ~tab->resv_mask;
 }
 
 
 static inline uintptr_t get_extra_ptr_bits(
 	const struct lfht_table *tab, uintptr_t e)
 {
-	return e & tab->common_mask;
+	return e & tab->common_mask & ~(tab->resv_mask & ~tab->perfect_bit);
 }
 
 
@@ -365,13 +536,22 @@ static inline void *get_raw_ptr(const struct lfht_table *tab, uintptr_t e) {
 }
 
 
-/* returns 0 on success, 1 to indicate that the caller should reload @tab, and
- * -1 when probe distance was exceeded.
+/* returns nonnegative slot index in @tab->table on success, -EAGAIN to
+ * indicate that the caller should reload @tab, and -ENOSPC when probe
+ * distance was exceeded. *@new_entry_p is filled in on success, and may be
+ * written to on failure. skips over slots that have @tab->hazard_bit set iff
+ * @extra_bits contains @tab->ephem_bit. decrements DELETED(@tab) iff the slot
+ * written to was a deleted row, and never increments ELEMS(@tab).
  */
-static int ht_add(struct lfht_table *tab, const void *p, size_t hash)
+static ssize_t ht_add(
+	uintptr_t *new_entry_p,
+	struct lfht_table *tab, const void *p, size_t hash,
+	uintptr_t extra_bits)
 {
+	assert(new_entry_p != NULL);
 	assert(((uintptr_t)p & tab->common_mask) == tab->common_bits);
-	assert(POPCOUNT(tab->perfect_bit) <= 1);
+	assert((extra_bits & tab->hazard_bit) == 0);
+
 	uintptr_t perfect = tab->perfect_bit;
 	size_t mask = (1ul << tab->size_log2) - 1, start = hash & mask,
 		end = (start + tab->max_probe) & mask,
@@ -379,43 +559,44 @@ static int ht_add(struct lfht_table *tab, const void *p, size_t hash)
 	do {
 		uintptr_t e = atomic_load_explicit(&tab->table[i],
 			memory_order_relaxed);
-		if(entry_is_valid(e)) {
-			if(!entry_is_avail(e)) {
-				/* optimization: not-avail means @tab is secondary, so
-				 * ht_add() should be tried again on the primary. this avoids
-				 * an off-cpu migration, so it's worth it.
-				 */
-				return 1;
-			}
-		} else {
-			uintptr_t hval;
-
 retry:
-			hval = make_hval(tab, p, get_hash_ptr_bits(tab, hash) | perfect);
-			if(e == LFHT_DELETED) {
+		if(!is_empty(tab, e)) {
+			if((e & tab->mig_bit) != 0) {
+				/* optimization: migration implies @tab is secondary, so
+				 * ht_add() should be tried again on the primary. this avoids
+				 * an eventual off-cpu migration.
+				 */
+				return -EAGAIN;
+			}
+			/* slot was occupied; go on to the next one. */
+		} else if((e & tab->hazard_bit) == 0
+			|| (extra_bits & tab->ephem_bit) == 0)
+		{
+			uintptr_t hval = make_hval(tab, p,
+				get_hash_ptr_bits(tab, hash) | perfect
+					| extra_bits | (e & tab->hazard_bit));
+			*new_entry_p = hval;
+			assert(is_val(tab, hval));
+			assert((e & tab->hazard_bit) == (hval & tab->hazard_bit));
+			if(!atomic_compare_exchange_strong_explicit(
+				&tab->table[i], &e, hval,
+				memory_order_release, memory_order_relaxed))
+			{
+				/* slot was snatched; go again. */
+				goto retry;
+			}
+
+			if(e == tab->del_bit) {
 				atomic_fetch_sub_explicit(&DELETED(tab), 1,
 					memory_order_relaxed);
 			}
-			uintptr_t old_e = e;
-			if(atomic_compare_exchange_strong_explicit(&tab->table[i], &e, hval,
-				memory_order_release, memory_order_relaxed))
-			{
-				return 0;
-			} else if(!entry_is_valid(e)) {
-				/* exotic case: an empty slot was filled, then deleted. try
-				 * again but fancily.
-				 */
-				assert(old_e != LFHT_DELETED);
-				goto retry;
-			} else {
-				/* slot was snatched. undo and keep going. */
-				if(old_e == LFHT_DELETED) atomic_fetch_add(&DELETED(tab), 1);
-			}
+			assert(i >= 0 && i <= SSIZE_MAX);
+			return i;
 		}
 		i = (i + 1) & mask;
 		perfect = 0;
 	} while(i != end);
-	return -1;
+	return -ENOSPC;
 }
 
 
@@ -432,17 +613,349 @@ static void *ht_val(
 	do {
 		uintptr_t e = atomic_load_explicit(&it->t->table[it->off],
 			memory_order_relaxed);
-		if(e == 0 || e == LFHT_NA_EMPTY) break;
-		if(e != LFHT_DELETED && e != LFHT_NA_FULL) {
-			if(get_extra_ptr_bits(it->t, e) == h2) {
-				return get_raw_ptr(it->t, e);
-			}
+		if(is_void(it->t, e)) break;
+		if(is_val(it->t, e) && get_extra_ptr_bits(it->t, e) == h2) {
+			return get_raw_ptr(it->t, e);
 		}
 		it->off = (it->off + 1) & mask;
 		h2 &= ~perfect;
 	} while(it->off != it->end);
 
 	return NULL;
+}
+
+
+static ssize_t ht_mig_filter(
+	struct lfht_table *src, ssize_t spos, uintptr_t *entry_p)
+{
+	assert(spos >= 0);
+	uintptr_t e = *entry_p;
+
+retry:
+	if(!is_val(src, e)) {
+		/* clear an empty slot. */
+		uintptr_t new = e == 0 ? mig_void(src) : mig_val(src);
+		assert(!is_val(src, new));
+		if(atomic_compare_exchange_strong_explicit(&src->table[spos],
+			&e, new, memory_order_release, memory_order_relaxed))
+		{
+			/* success. */
+			return 0;
+		} else {
+			/* concurrent modification. */
+			if((e & src->mig_bit) != 0) {
+				/* skip. */
+				assert(src->halt_gen_id > 0);
+				return -1;
+			} else {
+				/* reload and retry. */
+				*entry_p = e;
+				goto retry;
+			}
+		}
+	} else if((e & src->mig_bit) != 0 || (e & src->src_bit) != 0) {
+		/* in a table where migration was previously halted, rows may be
+		 * encountered where migration has either completed or is in progress.
+		 * they should be skipped.
+		 */
+		assert(src->halt_gen_id > 0);
+		return -1;
+	} else {
+		/* it's a valid migration source; proceed. */
+		return 1;
+	}
+}
+
+
+static ssize_t ht_mig_mark_and_copy(
+	size_t *hash_p, uintptr_t *dstval_p,
+	struct lfht *ht, struct lfht_table *dst,
+	struct lfht_table *src, struct lfht_table_percpu *src_pc, ssize_t spos,
+	uintptr_t *entry_p)
+{
+	uintptr_t e = *entry_p;
+
+	assert((e & src->src_bit) == 0);
+	assert((e & src->del_bit) == 0);
+	assert((e & src->mig_bit) == 0);
+	if(!atomic_compare_exchange_strong(
+		&src->table[spos], &e, e | src->src_bit))
+	{
+		/* `e' was concurrently updated. retry. */
+		*entry_p = e;
+		return -EINVAL;
+	}
+	e |= src->src_bit;
+
+	/* source entry marked, add dst copy. */
+	void *ptr = get_raw_ptr(src, e);
+	size_t hash = (*ht->rehash_fn)(ptr, ht->priv);
+	*hash_p = hash;
+	ssize_t n = ht_add(dstval_p, dst, ptr, hash, dst->ephem_bit);
+	if(unlikely(n < 0)) {
+		/* failure path. unmark source entry. */
+		uintptr_t old_e = e;
+		if(!atomic_compare_exchange_strong(
+			&src->table[spos], &e, e & ~src->src_bit))
+		{
+			assert(e == (old_e | src->del_bit));
+			/* concurrent deletion was indicated; bash the slot like
+			 * ht_mig_filter().
+			 */
+			atomic_store(&src->table[spos], mig_val(src));
+			atomic_fetch_sub(&src_pc->elems, 1);
+			*entry_p = mig_val(src);
+			return -ENOENT;
+		}
+		e &= ~src->src_bit;
+	} else {
+		atomic_fetch_add(&ELEMS(dst), 1);
+	}
+
+	*entry_p = e;
+	return n;
+}
+
+
+/* clears the ephemeral bit while completing another migrator's latent
+ * deletion by `sed → mig_val(@dst)'. return value is *@dstval_p's mig_bit
+ * cast to boolean.
+ */
+static bool ht_mig_clear_e(
+	struct lfht_table *dst, size_t dpos, uintptr_t *dstval_p)
+{
+	while((*dstval_p & dst->mig_bit) == 0) {
+		assert((*dstval_p & dst->hazard_bit) == 0);
+		uintptr_t state = *dstval_p & (dst->resv_mask & ~dst->perfect_bit),
+			newval;
+		if(likely(state == dst->ephem_bit)) {
+			/* clear e, set h. */
+			newval = (*dstval_p & ~dst->ephem_bit) | dst->hazard_bit;
+		} else if(state == (dst->ephem_bit | dst->del_bit)) {
+			/* late deletion of ephemeral item. */
+			newval = dst->del_bit | dst->hazard_bit;
+		} else if(state == (dst->ephem_bit | dst->src_bit | dst->del_bit)) {
+			/* clear the marker state for late deletion of ephemeral row while
+			 * it was a migration source. this can happen.
+			 */
+			newval = mig_val(dst);
+		} else {
+			assert("expected state e, ed, or sed" == NULL);
+		}
+		assert(!is_void(dst, newval));
+		if(atomic_compare_exchange_strong(
+			&dst->table[dpos], dstval_p, newval))
+		{
+			if((newval & (dst->mig_bit | dst->del_bit)) != 0) {
+				atomic_fetch_sub(&ELEMS(dst), 1);
+			}
+			*dstval_p = newval;
+			break;
+		}
+	}
+	return (*dstval_p & dst->mig_bit) != 0;
+}
+
+
+/* clears the hazard bit iff *@dstval_p has mig_bit clear. */
+static void ht_mig_clear_h(
+	struct lfht_table *dst, size_t dpos, uintptr_t *dstval_p)
+{
+	while((*dstval_p & dst->mig_bit) == 0) {
+		/* (this assert blowing indicates that someone, somewhere, didn't
+		 * pass the hazard bit through correctly when writing at @dpos.)
+		 */
+		assert((*dstval_p & dst->hazard_bit) != 0);
+		assert(!is_void(dst, *dstval_p & ~dst->hazard_bit));
+		if(atomic_compare_exchange_strong(&dst->table[dpos],
+			dstval_p, *dstval_p & ~dst->hazard_bit))
+		{
+			/* done. */
+			break;
+		}
+	}
+}
+
+
+/* decrements mig_left. @src_pc must be the percpu structure that
+ * take_mig_work() returned. @last_chunk may be the value from
+ * take_mig_work(), or false where not applicable.
+ *
+ * returns true when @src was removed from @ht, false otherwise.
+ */
+static bool ht_mig_advance(
+	struct lfht *ht, struct lfht_table *src, struct lfht_table_percpu *src_pc,
+	bool last_chunk)
+{
+	if(atomic_fetch_sub_explicit(&src_pc->mig_left, 1,
+			memory_order_relaxed) == 1
+		&& (last_chunk || get_total_mig_left(src) == 0))
+	{
+		/* emptied the table. it can now be removed. */
+		assert(src_pc->mig_next < src_pc->mig_last || src->halt_gen_id > 0);
+		remove_table(ht, src);
+		return true;
+	} else {
+		/* go on. */
+		return false;
+	}
+}
+
+
+/* returns 0 on success, -1 when the row was skipped or delayed (i.e. in the
+ * chain-creation case) and shouldn't be counted off mig_left by caller.
+ */
+static int ht_mig_resolve(
+	struct lfht *ht, size_t hash,
+	struct lfht_table *dst, size_t dpos, uintptr_t dstval,
+	struct lfht_table *src, struct lfht_table_percpu *src_pc, size_t spos,
+	uintptr_t srcval)
+{
+	assert((dstval & dst->ephem_bit) != 0);
+	uintptr_t ptr = mig_ptr(src, dst->gen_id, probe_addr(dpos, hash, dst)),
+		bits;
+	assert(mig_slot(src, hash, ptr, dst) == dpos);
+	assert(mig_gen_id(src, ptr) == dst->gen_id);
+
+retry:
+	bits = srcval & (src->src_bit | src->ephem_bit | src->del_bit);
+	if(likely(bits == src->src_bit)) {
+		/* unconflicted case. store the migration source pointer, making the
+		 * source row no longer subject to late deletion and permitting late
+		 * deletion of the destination row.
+		 */
+		assert(!is_void(src, ptr));
+		if(!atomic_compare_exchange_strong(&src->table[spos], &srcval, ptr)) {
+			goto retry;
+		}
+		atomic_fetch_sub(&src_pc->elems, 1);
+		bool dst_is_mig, chain_root = true;
+chain_retry:
+		dst_is_mig = ht_mig_clear_e(dst, dpos, &dstval);
+		atomic_store(&src->table[spos], mig_val(src));
+		if(likely(!dst_is_mig) || mig_gen_id(dst, dstval) == 0) {
+			/* ordinary case. clear hazard bit and finish. */
+			assert((dstval & dst->hazard_bit) != 0);
+			ht_mig_clear_h(dst, dpos, &dstval);
+		} else {
+			/* walking down the chain. */
+			assert(dst != get_main(ht));
+			assert(src->gen_id < dst->gen_id);
+			if(!chain_root) ht_mig_advance(ht, src, src_pc, false);
+			chain_root = false;
+			src = dst; spos = dpos; srcval = dstval; src_pc = MY_PERCPU(src);
+			mig_deref(ht, hash, &dst, &dpos, &dstval, srcval);
+			assert(dst != src);
+			assert(src->gen_id < dst->gen_id);
+			goto chain_retry;
+		}
+		return 0;
+	} else if(bits == (src->src_bit | src->ephem_bit)) {
+		/* chaining case. */
+		assert(!is_void(src, ptr));
+		if(!atomic_compare_exchange_strong(&src->table[spos], &srcval, ptr)) {
+			goto retry;
+		}
+		atomic_fetch_sub(&src_pc->elems, 1);
+		return -1;	/* don't count off from mig_left */
+	} else {
+		assert((bits & src->del_bit) != 0);
+		/* deleted case. */
+		uintptr_t newdst;
+
+del_retry:
+		/* remove dest row, perhaps latently. */
+		assert((dstval & dst->del_bit) == 0);
+		newdst = dst->del_bit;
+		if((dstval & dst->src_bit) != 0) newdst |= dstval;
+		uintptr_t olddst = dstval;
+		assert(!is_void(dst, newdst));
+		if(!atomic_compare_exchange_strong(
+			&dst->table[dpos], &dstval, newdst))
+		{
+			assert((olddst & dst->src_bit) == 0);
+			/* (this one blows up when dstval has been late deleted while
+			 * ephemeral but source existed, such as when a mig pointer fuckup
+			 * causes wrong matching.)
+			 */
+			assert(dstval == (olddst | dst->src_bit));
+			goto del_retry;
+		}
+		atomic_fetch_sub(&DELETED(dst), 1);
+
+		/* remove source. */
+		atomic_store(&src->table[spos], mig_val(src));
+		atomic_fetch_sub(&src_pc->elems, 1);
+		return 0;
+	}
+}
+
+
+/* migrate a single entry from @src at @spos into @dst. performs migration to
+ * @dst (or @ht's main table) if the entry is valid, leaving the slot with
+ * mig_bit set regardless.
+ *
+ * returns 0 on successful migration, <0 to skip the row, and >0 to skip the
+ * table (as in the NOSPC case).
+ */
+static int ht_migrate_entry(
+	struct lfht *ht, struct lfht_table *dst,
+	struct lfht_table *src, struct lfht_table_percpu *src_pc, ssize_t spos)
+{
+	assert(spos >= 0);
+	ssize_t n;
+	size_t hash;
+	uintptr_t e = atomic_load_explicit(&src->table[spos],
+		memory_order_relaxed), dstval;
+
+e_retry:
+	n = ht_mig_filter(src, spos, &e);
+	if(n <= 0) return n;	/* simple completion and skipping. */
+
+dst_retry:
+	n = ht_mig_mark_and_copy(&hash, &dstval, ht, dst, src, src_pc, spos, &e);
+	if(unlikely(n < 0)) {
+		struct lfht_table *rarest = get_main(ht);
+		if(n == -EINVAL) goto e_retry;	/* `e' was reloaded. try again. */
+		else if(n == -EAGAIN) {
+			/* @dst was under migration. refetch @dst and try again. */
+			assert(rarest != dst);
+			dst = rarest;
+			goto dst_retry;
+		} else if(n == -ENOSPC) {
+			/* copy couldn't be inserted because probe length was exceeded.
+			 *
+			 * most of the time, hash chains in @src should be as long or
+			 * shorter when moved into @dst, but it's possible for items added
+			 * to @dst to increase a chain past that limit, particularly with
+			 * rehash and remask tables. this breaks migration.
+			 *
+			 * the solution used here halts migration of this table until the
+			 * primary table becomes something besides @dst. interrupted
+			 * migration is noted in @src->mig_next, causing migrated rows to
+			 * possibly appear in ht_migrate_entry().
+			 */
+			if(rarest != dst) {
+				/* though, try again in the main table if distinct. */
+				dst = rarest;
+				goto dst_retry;
+			} else {
+				increase_to(&src->halt_gen_id, dst->gen_id);
+				increase_to(&src_pc->mig_next, spos);
+				/* skip @src; migration may succeed from elsewhere. */
+				return 1;
+			}
+		} else {
+			assert(n == -ENOENT);
+			/* same as above, but the source row was concurrently deleted
+			 * during the ht_mig_mark_and_copy() error path. this is success
+			 * per ht_mig_filter()'s interface.
+			 */
+			return 0;		/* completed. */
+		}
+	}
+
+	return ht_mig_resolve(ht, hash, dst, n, dstval, src, src_pc, spos, e);
 }
 
 
@@ -481,112 +994,30 @@ static ssize_t take_mig_work(
 }
 
 
-/* check an entry in @src, migrate it to @dst (or @ht's main table) if valid.
+/* driver function of the migration operation. gets a work slot in @src and
+ * passes it along to ht_migrate_entry(), removing tables as migration
+ * completes.
+ *
  * returns true when @src became empty, was already empty, or migration was
  * blocked on it.
  */
-static bool ht_migrate_entry(
+static bool ht_migrate_once(
 	struct lfht *ht, struct lfht_table *dst, struct lfht_table *src)
 {
-	assert(src != dst);
-	assert(POPCOUNT(dst->common_mask) <= POPCOUNT(src->common_mask));
-	assert(src->gen_id < dst->gen_id);
-
 	struct lfht_table_percpu *src_pc;
-	ssize_t spos;
 	bool last_chunk;
-spos_retry:
-	spos = take_mig_work(&last_chunk, &src_pc, src);
-	if(spos < 0) return true;
+	for(;;) {
+		ssize_t spos = take_mig_work(&last_chunk, &src_pc, src);
+		if(spos < 0) return true;	/* skip table (completed) */
 
-	uintptr_t e = atomic_load_explicit(&src->table[spos],
-		memory_order_relaxed);
-e_retry:
-	if(!entry_is_avail(e)) {
-		/* in a table where migration was previously halted, non-available
-		 * rows may be encountered. they should be skipped in a loop.
-		 */
-		assert(src->halt_gen_id > 0);
-		goto spos_retry;
-	}
-	if(!entry_is_valid(e)) {
-		uintptr_t new = e == 0 ? LFHT_NA_EMPTY : LFHT_NA_FULL;
-		if(!atomic_compare_exchange_strong_explicit(&src->table[spos],
-			&e, new, memory_order_release, memory_order_relaxed))
-		{
-			/* concurrent modification: a ht_add() filled the slot in, a
-			 * lfht_delval() deleted the item, or a ht_migrate_entry() moved
-			 * the entry out (implying that migration was halted on @src).
-			 */
-			if(src->halt_gen_id > 0 && !entry_is_avail(e)) goto spos_retry;
-			else {
-				assert(entry_is_valid(e) || e == LFHT_DELETED);
-				goto e_retry;
-			}
-		}
-	} else {
-		struct lfht_table_percpu *dst_pc;
-dst_retry:
-		dst_pc = MY_PERCPU(dst);
-		atomic_fetch_add_explicit(&dst_pc->elems, 1, memory_order_relaxed);
-		void *ptr = get_raw_ptr(src, e);
-		size_t hash = (*ht->rehash_fn)(ptr, ht->priv);
-		int n = ht_add(dst, ptr, hash);
-		if(n == 0 && atomic_compare_exchange_strong_explicit(&src->table[spos],
-			&e, LFHT_NA_FULL, memory_order_relaxed, memory_order_relaxed))
-		{
-			atomic_fetch_sub_explicit(&src_pc->elems, 1, memory_order_release);
-		} else if(n == 0) {
-			/* deleted under our feet (or migrated, but that only happens if
-			 * migration from @src was previously halted). that's fine.
-			 */
-			assert(!entry_is_valid(e) || src->halt_gen_id > 0);
-			assert(entry_is_avail(e) || src->halt_gen_id > 0);
-			/* drop the extra item from wherever it wound up at. */
-			bool ok = lfht_del(ht, hash, ptr);
-			assert(ok);
-			goto e_retry;
-		} else if(n > 0) {
-			/* @dst was made secondary. refetch and try again. */
-			atomic_fetch_sub_explicit(&dst_pc->elems, 1, memory_order_relaxed);
-			struct lfht_table *rarest = get_main(ht);
-			assert(rarest != dst);
-			dst = rarest;
-			goto dst_retry;
-		} else {
-			assert(n < 0);
-			/* ptr/hash can't be inserted because probe length was exceeded.
-			 *
-			 * most of the time, hash chains in @src should be as long or
-			 * shorter when moved into @dst, but it's possible for items added
-			 * to @dst to increase a chain past that limit, particularly with
-			 * rehash and remask tables. this breaks migration.
-			 *
-			 * the solution used here halts migration of this table until the
-			 * primary table becomes something besides @dst. interrupted
-			 * migration is noted in @src->mig_next, causing migrated rows to
-			 * possibly appear in ht_migrate_entry().
-			 */
-			atomic_fetch_sub_explicit(&dst_pc->elems, 1, memory_order_relaxed);
-			increase_to(&src->halt_gen_id, dst->gen_id);
-			increase_to(&src_pc->mig_next, spos);
-			/* skip this table; migration from somewhere else may succeed. */
-			return true;
-		}
+		int n = ht_migrate_entry(ht, dst, src, src_pc, spos);
+		if(n == 0) break;	/* ok */
+		else if(n > 0) return true;	/* skip table (blocked) */
+		assert(n < 0);	/* skip row (take again) */
 	}
 
-	if(atomic_fetch_sub_explicit(&src_pc->mig_left, 1,
-			memory_order_relaxed) == 1
-		&& (last_chunk || get_total_mig_left(src) == 0))
-	{
-		/* migration has emptied the table. it can now be removed. */
-		assert(src_pc->mig_next < src_pc->mig_last || src->halt_gen_id > 0);
-		remove_table(ht, src);
-		return true;
-	} else {
-		/* go on. */
-		return false;
-	}
+	/* check it off and test for completion. */
+	return ht_mig_advance(ht, src, src_pc, last_chunk);
 }
 
 
@@ -615,7 +1046,7 @@ static void ht_migrate(struct lfht *ht, struct lfht_table *dst)
 
 	int n_times = dst->size_log2 > sec->size_log2 && single ? 1 : 3;
 	for(int i=0; i < n_times; i++) {
-		if(ht_migrate_entry(ht, dst, sec) && n_times > 1) {
+		if(ht_migrate_once(ht, dst, sec) && n_times > 1) {
 			sec = next_table_gen(ht, sec, true);
 			if(sec == NULL || sec->gen_id >= dst->gen_id) {
 				assert(sec == NULL
@@ -685,48 +1116,38 @@ bool lfht_add(struct lfht *ht, size_t hash, void *p)
 		}
 	}
 
-	struct lfht_table_percpu *pc;
-
-retry:
-	pc = MY_PERCPU(tab);
-	atomic_fetch_add_explicit(&pc->elems, 1, memory_order_relaxed);
-
-	if(((uintptr_t)p & tab->common_mask) != tab->common_bits) {
-		atomic_fetch_sub_explicit(&pc->elems, 1, memory_order_relaxed);
-		tab = remask_table(ht, tab, p);
-		if(tab == NULL) goto fail;
-		goto retry;
-	}
-
-	int n = ht_add(tab, p, hash);
-	if(n > 0) {
-		/* tab was made secondary and migration twilight reached where @hash
-		 * would land. undo and retry to avoid a further off-cpu migration.
-		 */
-		atomic_fetch_sub_explicit(&pc->elems, 1, memory_order_relaxed);
-		tab = get_main(ht);
-		goto retry;
-	} else if(n < 0) {
-		/* probe limit was reached. double or rehash the table. */
-		size_t elems, deleted;
-		get_totals(&elems, &deleted, NULL, tab);
-		if(elems + 1 <= tab->max
-			&& elems + 1 + deleted > tab->max_with_deleted)
-		{
-			struct lfht_table *oldtab = tab;
-			tab = rehash_table(ht, tab);
-			if(likely(tab != oldtab)) {
-				atomic_fetch_sub_explicit(&ELEMS(oldtab), 1,
-					memory_order_relaxed);
-			}
-		} else {
-			atomic_fetch_sub_explicit(&pc->elems, 1, memory_order_relaxed);
-			tab = double_table(ht, tab, p);
+	ssize_t n;
+	do {
+		if(((uintptr_t)p & tab->common_mask) != tab->common_bits) {
+			tab = remask_table(ht, tab, p);
 			if(tab == NULL) goto fail;
+			assert(((uintptr_t)p & tab->common_mask) == tab->common_bits);
 		}
-		goto retry;
-	}
 
+		uintptr_t new_entry;
+		n = ht_add(&new_entry, tab, p, hash, 0);
+		if(n == -EAGAIN) {
+			/* @tab became secondary. reload tab'=main and retry to avoid a
+			 * future off-cpu migration.
+			 */
+			tab = get_main(ht);
+		} else if(n == -ENOSPC) {
+			/* probe limit was reached. double or rehash the table. */
+			size_t elems, deleted;
+			get_totals(&elems, &deleted, NULL, tab);
+			if(elems + 1 <= tab->max
+				&& elems + 1 + deleted > tab->max_with_deleted)
+			{
+				tab = rehash_table(ht, tab);
+				assert(tab != NULL);
+			} else {
+				tab = double_table(ht, tab, p);
+				if(tab == NULL) goto fail;
+			}
+		}
+	} while(n < 0);
+	assert(n >= 0);
+	atomic_fetch_add_explicit(&ELEMS(tab), 1, memory_order_relaxed);
 	ht_migrate(ht, tab);
 
 	e_end(eck);
@@ -738,24 +1159,89 @@ fail:
 }
 
 
+/* for all next tables of @dst, find a migration pointer within the probe area
+ * of @hash that points to @dpos within @dst; or find a source-marked entry
+ * that matches the one in @dst->table[@dpos] and mark it for late deletion.
+ *
+ * returns 0 when an entry was found, -ENOENT when it wasn't, and >0 when
+ * del_bit was set in a matching source entry.
+ */
+static int hunt_mig_ptr(
+	struct lfht_table *dst, size_t dpos, size_t hash, void *p)
+{
+	assert(dpos <= SSIZE_MAX);
+	size_t p_addr = probe_addr(dpos, hash, dst);
+	for(struct lfht_table *s = get_next(dst); s != NULL; s = get_next(s)) {
+		uintptr_t ptr = mig_ptr(s, dst->gen_id, p_addr);
+		size_t mask = (1ul << s->size_log2) - 1,
+			pos = hash & mask, end = (pos + s->max_probe) & mask;
+		do {
+			uintptr_t e = atomic_load_explicit(&s->table[pos],
+				memory_order_relaxed);
+e_retry:
+			if(e == ptr) {
+				assert(mig_slot(s, hash, e, dst) == dpos);
+				assert(mig_gen_id(s, e) == dst->gen_id);
+				return 0;
+			} else if(is_void(s, e)) break;
+			else if((e & s->src_bit) != 0 && get_raw_ptr(s, e) == p
+				&& (e & (s->ephem_bit | s->del_bit)) == 0)
+			{
+				if(!atomic_compare_exchange_strong(&s->table[pos],
+					&e, e | s->del_bit))
+				{
+					/* consume it again. */
+					goto e_retry;
+				}
+				return 1;
+			}
+			pos = (pos + 1) & mask;
+		} while(pos != end);
+	}
+	return -ENOENT;
+}
+
+
 bool lfht_delval(const struct lfht *ht, struct lfht_iter *it, void *p)
 {
 	assert(e_inside());
 
 	uintptr_t e = atomic_load_explicit(&it->t->table[it->off],
-		memory_order_relaxed);
-	if(get_raw_ptr(it->t, e) == p
-		&& atomic_compare_exchange_strong_explicit(
-			&it->t->table[it->off], &e, LFHT_DELETED,
-			memory_order_release, memory_order_relaxed))
-	{
+		memory_order_relaxed), new_e;
+	do {
+		if(!is_val(it->t, e) || get_raw_ptr(it->t, e) != p) {
+			/* plz no step on snek */
+			return false;
+		}
+
+		new_e = it->t->del_bit | (e & it->t->hazard_bit);
+		if((e & it->t->src_bit) != 0) {
+			assert((e & it->t->del_bit) == 0);	/* per is_val() */
+			new_e |= e;
+		} else if((e & it->t->ephem_bit) != 0) {
+			/* hunt for a compatible MIG entry. if found, set `d'. if a source
+			 * entry matching @p became marked for late deletion, succeed
+			 * immediately.
+			 */
+			int n = hunt_mig_ptr(it->t, it->off, it->hash, p);
+			if(likely(n == 0)) new_e |= e;
+			else if(n > 0) return true;
+			else {
+				return false;
+			}
+		}
+	} while(!atomic_compare_exchange_strong_explicit(
+		&it->t->table[it->off], &e, new_e,
+		memory_order_relaxed, memory_order_relaxed));
+	assert((e & it->t->hazard_bit) == (new_e & it->t->hazard_bit));
+
+	if((e & (it->t->src_bit | it->t->ephem_bit)) == 0) {
 		struct lfht_table_percpu *pc = MY_PERCPU(it->t);
 		atomic_fetch_add_explicit(&pc->deleted, 1, memory_order_relaxed);
-		atomic_fetch_sub_explicit(&pc->elems, 1, memory_order_relaxed);
-		return true;
-	} else {
-		return false;
+		atomic_fetch_sub_explicit(&pc->elems, 1, memory_order_acq_rel);
 	}
+
+	return true;
 }
 
 
@@ -786,6 +1272,7 @@ static inline void lfht_iter_init(
 	it->t = tab;
 	it->off = hash & mask;
 	it->end = (it->off + tab->max_probe) & mask;
+	it->hash = hash;
 	it->perfect = tab->perfect_bit;
 }
 
