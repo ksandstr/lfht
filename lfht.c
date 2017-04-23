@@ -531,10 +531,15 @@ e_retry:
 		if(!atomic_compare_exchange_strong_explicit(&src->table[spos],
 			&e, new, memory_order_release, memory_order_relaxed))
 		{
-			/* a concurrent ht_add() filled it in. try again. */
-			assert(entry_is_avail(e));	/* single work assignment property */
-			assert(entry_is_valid(e) || e == LFHT_DELETED);
-			goto e_retry;
+			/* concurrent modification: a ht_add() filled the slot in, a
+			 * lfht_delval() deleted the item, or a ht_migrate_entry() moved
+			 * the entry out (implying that migration was halted on @src).
+			 */
+			if(src->halt_gen_id > 0 && !entry_is_avail(e)) goto spos_retry;
+			else {
+				assert(entry_is_valid(e) || e == LFHT_DELETED);
+				goto e_retry;
+			}
 		}
 	} else {
 		struct lfht_table_percpu *dst_pc;
