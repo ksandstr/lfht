@@ -65,25 +65,12 @@ static inline struct lfht_table *get_next(const struct lfht_table *tab) {
 }
 
 
-static uintptr_t get_perfect_bit(const struct lfht_table *tab)
+static inline uintptr_t get_perfect_bit(const struct lfht_table *tab)
 {
 	/* deviate from CCAN htable by preferring very high-order bits. could
-	 * replace MSB() with ffsl(avail) - 1 to do the opposite, but why bother?
+	 * replace MSB(...) with ffsl(...) - 1 to do the opposite, but why bother?
 	 */
-	uintptr_t avail = tab->common_mask & ~tab->common_bits,
-		fast = unlikely(avail == 0) ? 0 : (uintptr_t)1 << MSB(avail);
-
-#ifndef NDEBUG
-	uintptr_t try;
-	for(int i = sizeof(uintptr_t) * 8 - 1; i >= 0; i--) {
-		try = (uintptr_t)1 << i;
-		if((tab->common_mask & try) != 0 && (tab->common_bits & try) == 0) {
-			break;
-		}
-	}
-	assert(fast == 0 || fast == try);
-#endif
-	return fast;
+	return tab->common_mask == 0 ? 0 : (uintptr_t)1 << MSB(tab->common_mask);
 }
 
 
@@ -127,7 +114,6 @@ static void set_bits(
 	assert(POPCOUNT(tab->perfect_bit) <= 1);
 	assert(tab->perfect_bit == 0
 		|| (tab->perfect_bit & tab->common_mask) != 0);
-	assert((tab->perfect_bit & tab->common_bits) == 0);
 }
 
 
