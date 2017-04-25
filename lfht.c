@@ -21,7 +21,7 @@
 #define MIN_SIZE_LOG2 LFHT_MIN_TABLE_SIZE
 #define MIN_PROBE (64 * 2 / sizeof(uintptr_t))
 
-#define POPCOUNT(x) __builtin_popcount((x))
+#define POPCOUNT(x) __builtin_popcountl((x))
 #define MSB(x) (sizeof((x)) * 8 - __builtin_clzl((x)) - 1)
 
 #define MY_PERCPU(t) ((struct lfht_table_percpu *)percpu_my((t)->pc))
