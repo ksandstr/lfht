@@ -19,6 +19,8 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 
+#include <ccan/container_of/container_of.h>
+
 
 struct nbsl_node {
 	_Atomic uintptr_t next;
@@ -63,13 +65,24 @@ extern struct nbsl_node *nbsl_top(const struct nbsl *list);
 extern bool nbsl_del(struct nbsl *list, struct nbsl_node *n);
 
 
+/* simple iteration. */
+#define nbsl_next_node(n, typ, field) \
+	container_of_or_null(_nbsl_get_next((n)), typ, field)
+#define nbsl_first_node(head, typ, field) \
+	container_of_or_null(_nbsl_get_next(&(head)->n), typ, field)
+
+static inline struct nbsl_node *_nbsl_get_next(const struct nbsl_node *n) {
+	return (struct nbsl_node *)(n->next & ~(uintptr_t)3);
+}
+
+
 struct nbsl_iter {
 	struct nbsl_node *prev, *cur;
 };
 
-/* iteration. this is always read-only, i.e. never causes writes to any node
- * along the chain. it skips over dead nodes, but the ones it returns may
- * appear dead nonetheless due to concurrent delete.
+/* iteration with option to delete. this is always read-only, i.e. never
+ * causes writes to any node along the chain. it skips over dead nodes, but
+ * the ones it returns may appear dead nonetheless due to concurrent delete.
  */
 extern struct nbsl_node *nbsl_first(
 	const struct nbsl *list, struct nbsl_iter *it);

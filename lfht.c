@@ -59,9 +59,7 @@ static inline struct lfht_table *get_main(const struct lfht *lfht) {
 
 
 static inline struct lfht_table *get_next(const struct lfht_table *tab) {
-	/* FIXME: make a function in nbsl.h for this */
-	struct nbsl_node *n = (struct nbsl_node *)(tab->link.next & ~(uintptr_t)3);
-	return container_of_or_null(n, struct lfht_table, link);
+	return nbsl_next_node(&tab->link, struct lfht_table, link);
 }
 
 
