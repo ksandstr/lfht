@@ -374,7 +374,6 @@ static int ht_add(struct lfht_table *tab, const void *p, size_t hash)
 {
 	assert(((uintptr_t)p & tab->common_mask) == tab->common_bits);
 	assert(POPCOUNT(tab->perfect_bit) <= 1);
-	assert((tab->common_bits & tab->perfect_bit) == 0);
 	uintptr_t perfect = tab->perfect_bit;
 	size_t mask = (1ul << tab->size_log2) - 1, start = hash & mask,
 		end = (start + tab->max_probe) & mask,
