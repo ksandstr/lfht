@@ -146,7 +146,7 @@ int main(void)
 	}
 
 	/* no thread should observe failure. */
-	bool found_before = true, found_immed = true, found_delay = true;
+	bool found_before = false, found_immed = true, found_delay = true;
 	for(int i=0; i < num_threads; i++) {
 		void *resultptr = NULL;
 		int n = pthread_join(ts[i], &resultptr);
@@ -155,7 +155,7 @@ int main(void)
 			abort();
 		}
 		struct result *r = resultptr;
-		found_before = found_before && r->before;
+		found_before = found_before || r->before;
 		found_immed = found_immed && r->immed;
 		found_delay = found_delay && r->delay;
 		free(r);
