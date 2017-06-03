@@ -569,7 +569,7 @@ dst_retry:
 			 */
 			atomic_fetch_sub_explicit(&dst_pc->elems, 1, memory_order_relaxed);
 			increase_to(&src->halt_gen_id, dst->gen_id);
-			increase_to(&src_pc->mig_next, spos + 1);
+			increase_to(&src_pc->mig_next, spos);
 			/* skip this table; migration from somewhere else may succeed. */
 			return true;
 		}
