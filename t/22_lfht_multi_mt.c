@@ -6,6 +6,9 @@
  * left empty afterward. inserts happen multiple times per key per thread, and
  * deletion happens once during the insert loop and the other times at the
  * end.
+ *
+ * TODO: this test is of overall questionable value since 23_lfht_multi_del.c;
+ * it should be reëvaluated and likely removed.
  */
 
 #include <stdio.h>
