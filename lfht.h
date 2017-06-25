@@ -31,9 +31,10 @@ struct lfht_table
 	/* common_mask indicates bits that're the same across all keys;
 	 * common_bits specifies what those bits are.
 	 *
-	 * the *_bit fields are reserved bits, which are either set in common_mask
-	 * and resv_mask or themselves zero. their positions are never used to
-	 * store match bits derived from the hash value.
+	 * *_bit are the values of reserved bits. they are either set in
+	 * common_mask and resv_mask or (in the case of perfect_bit) unallocated
+	 * and equal to zero. reserved bits' positions are never used to store
+	 * match bits derived from the hash value.
 	 */
 	uintptr_t common_mask, common_bits, resv_mask;
 	uintptr_t perfect_bit;
@@ -42,14 +43,15 @@ struct lfht_table
 	 *
 	 * src_bit is set in a migration source entry until the state of the
 	 * source half is resolved to either successful migration or concurrent
-	 * deletion. it is exclusive with ephem_bit.
+	 * deletion. it may co-occur with ephem_bit due to a delayed migration; in
+	 * this case migration pointer chaining occurs.
 	 *
 	 * del_bit marks late deletion in a migration source or ephemeral target
 	 * entry when concurrent deletion finds that src_bit was set, or ephem_bit
 	 * was set and a corresponding migration pointer was found.
 	 *
 	 * ephem_bit is set in a migration target entry before the migration is
-	 * confirmed successful.
+	 * confirmed successful. it's mutually exclusive wrt hazard_bit.
 	 *
 	 * mig_bit is set in entries that've been migrated. it designates an
 	 * independent subformat where mig_bit is set and other bits are used for
@@ -58,8 +60,10 @@ struct lfht_table
 	 * are documented in lfht.c .
 	 *
 	 * hazard_bit is set in slots that're subject to a potential ABBA race if
-	 * an entry with equal value were migrated in. ht_add() will skip slots
-	 * with hazard_bit set when the incoming entry has ephem_bit set.
+	 * the entry were deleted, and then the same value migrated in again.
+	 * ht_add() will skip slots with hazard_bit set when the incoming entry
+	 * has ephem_bit set, and migration will clear hazard_bit once it has
+	 * cleared the corresponding migration pointer.
 	 */
 	uintptr_t ephem_bit, src_bit, del_bit, mig_bit, hazard_bit;
 
