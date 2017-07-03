@@ -58,6 +58,12 @@ static inline char *format_entry(
 #endif
 
 
+static int size_to_log2(size_t s) {
+	int msb = MSB(s);
+	return (1ul << msb) < s ? msb + 1 : msb;
+}
+
+
 /* true if @e (from @t->table) terminates probing. */
 static inline bool is_void(const struct lfht_table *t, uintptr_t e) {
 	return (e & ~t->mig_bit) == 0;
@@ -353,18 +359,17 @@ static struct lfht_table *new_table(int sizelog2)
 	tab->max = ((size_t)3 << sizelog2) / 4;
 	tab->max_with_deleted = ((size_t)9 << sizelog2) / 10;
 
-	/* set max probe depth to max(16, n_entries / 32), i.e. as low as two
-	 * cachelines on 64-bit which'll touch 3 cachelines on average. this
-	 * causes mildly pessimal performance (and heavy reliance on the runtime's
-	 * lazy heap) when a single hash chain is very long, or the hash function
-	 * generates a poor distribution from e.g. strings that share a prefix,
-	 * such as multiply-accumulate variations; but then recovers as the table
-	 * gets bigger.
+	/* maximum probe distance is statically limited to 128k by the migration
+	 * pointer format on 32-bit targets, and arbitrarily capped to 4/5ths of
+	 * table size.
+	 *
+	 * TODO: better formulas exist. apply them.
 	 */
-	tab->max_probe = (1ul << sizelog2) / 32;
+	tab->max_probe = (4ul << tab->size_log2) / 5;
 	if(tab->max_probe < MIN_PROBE) tab->max_probe = MIN_PROBE;
-	tab->probe_addr_size_log2 = ffsl(tab->max_probe * 3) + 1;
-	assert((1ul << tab->probe_addr_size_log2) >= tab->max_probe * 3);
+	else if(tab->max_probe > 128 * 1024) tab->max_probe = 128 * 1024;
+	tab->probe_addr_size_log2 = size_to_log2(tab->max_probe * 2);
+	assert((1ul << tab->probe_addr_size_log2) >= tab->max_probe * 2);
 	assert(tab->probe_addr_size_log2 <= sizeof(uintptr_t) * 8 - 11);
 
 	/* assign migration chunks. */
