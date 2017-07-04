@@ -1207,13 +1207,65 @@ e_retry:
 }
 
 
+/* initialize for a new @tab. */
+static inline void lfht_iter_init(
+	struct lfht_iter *it, struct lfht_table *tab, size_t hash)
+{
+	size_t mask = (1ul << tab->size_log2) - 1;
+	it->t = tab;
+	it->off = hash & mask;
+	it->end = (it->off + tab->max_probe) & mask;
+	it->hash = hash;
+	it->perfect = tab->perfect_bit;
+}
+
+
+static bool find_migrated_val(
+	const struct lfht *ht, struct lfht_iter *it, void *p)
+{
+	/* (blows when an item's hash changes during its lifetime in @ht.) */
+	assert(it->hash == (*ht->rehash_fn)(p, ht->priv));
+	size_t hash = it->hash;
+	void *cand;
+	while((cand = lfht_nextval(ht, it, hash)) != NULL) {
+		if(cand == p) return true;
+	}
+	return false;
+}
+
+
 bool lfht_delval(const struct lfht *ht, struct lfht_iter *it, void *p)
 {
 	assert(e_inside());
 
-	uintptr_t e = atomic_load_explicit(&it->t->table[it->off],
-		memory_order_relaxed), new_e;
+	struct lfht_iter our_it;
+	uintptr_t e, new_e;
+
+mig_retry:
+	e = atomic_load_explicit(&it->t->table[it->off], memory_order_relaxed);
 	do {
+		if((e & it->t->mig_bit) != 0) {
+			if(it != &our_it) {
+				our_it = *it;
+				it = &our_it;
+			}
+			if(mig_gen_id(it->t, e) > 0) {
+				/* dereference the migration pointer without advancing the
+				 * given iterator. this may happen any number of times without
+				 * missing other items -- which lfht_delval() doesn't care
+				 * about anyway.
+				 */
+				struct lfht_table *tab = it->t;
+				size_t pos;
+				mig_deref(ht, it->hash, &tab, &pos, &e, e);
+				lfht_iter_init(it, tab, it->hash);
+			} else {
+				/* go forward, see if there's @p elsewhere. */
+				if(!find_migrated_val(ht, it, p)) return false;
+			}
+			goto mig_retry;
+		}
+
 		if(!is_val(it->t, e) || get_raw_ptr(it->t, e) != p) {
 			/* plz no step on snek */
 			return false;
@@ -1229,11 +1281,7 @@ bool lfht_delval(const struct lfht *ht, struct lfht_iter *it, void *p)
 			 * immediately.
 			 */
 			int n = hunt_mig_ptr(it->t, it->off, it->hash, p);
-			if(likely(n == 0)) new_e |= e;
-			else if(n > 0) return true;
-			else {
-				return false;
-			}
+			if(likely(n == 0)) new_e |= e; else return n > 0;
 		}
 	} while(!atomic_compare_exchange_strong_explicit(
 		&it->t->table[it->off], &e, new_e,
@@ -1266,19 +1314,6 @@ bool lfht_del(struct lfht *ht, size_t hash, const void *p)
 	}
 	e_end(eck);
 	return found;
-}
-
-
-/* initialize for a new @tab. */
-static inline void lfht_iter_init(
-	struct lfht_iter *it, struct lfht_table *tab, size_t hash)
-{
-	size_t mask = (1ul << tab->size_log2) - 1;
-	it->t = tab;
-	it->off = hash & mask;
-	it->end = (it->off + tab->max_probe) & mask;
-	it->hash = hash;
-	it->perfect = tab->perfect_bit;
 }
 
 
