@@ -112,11 +112,8 @@ extern void lfht_init_sized(
 	size_t size);
 
 extern void lfht_clear(struct lfht *ht);
-
 /* TODO: lfht_copy(), lfht_rehash() */
 
-extern bool lfht_add(struct lfht *ht, size_t hash, void *p);
-extern bool lfht_del(struct lfht *ht, size_t hash, const void *p);
 
 /* valid for lfht_del_at() iff ->off != ->end, or rather,
  * ->off < ->end (mod @t->size).
@@ -127,15 +124,32 @@ struct lfht_iter {
 	uintptr_t perfect;
 };
 
+#define LFHT_ADD_ITER(hash_) ((struct lfht_iter){ .hash = (hash_) })
+
 extern void *lfht_firstval(
 	const struct lfht *ht, struct lfht_iter *it, size_t hash);
 
 extern void *lfht_nextval(
 	const struct lfht *ht, struct lfht_iter *it, size_t hash);
 
+/* same as lfht_add(), but when the hash remains the same from call to
+ * another, multiset insert becomes O(n) instead of O(n^2). @iter should point
+ * to a lfht_iter initialized with LFHT_ADD_ITER() before first call, when the
+ * hash changes, and after end of epoch.
+ */
+extern bool lfht_add_many(struct lfht *ht, struct lfht_iter *iter, void *p);
+
+
+static inline bool lfht_add(struct lfht *ht, size_t hash, void *p) {
+	struct lfht_iter it = LFHT_ADD_ITER(hash);
+	return lfht_add_many(ht, &it, p);
+}
+
+extern bool lfht_del(struct lfht *ht, size_t hash, const void *p);
+
 /* convenience function for retrieving the first matching item. caller must
  * have an existing epoch bracket, or the returned pointer will be invalid and
- * the iteration will go into undefined la-la land.
+ * iteration will go into undefined la-la land.
  */
 static inline void *lfht_get(
 	const struct lfht *ht, size_t hash,

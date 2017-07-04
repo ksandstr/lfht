@@ -541,66 +541,81 @@ static inline void *get_raw_ptr(const struct lfht_table *tab, uintptr_t e) {
 }
 
 
-/* returns nonnegative slot index in @tab->table on success, -EAGAIN to
- * indicate that the caller should reload @tab, and -ENOSPC when probe
- * distance was exceeded. *@new_entry_p is filled in on success, and may be
- * written to on failure. skips over slots that have @tab->hazard_bit set iff
- * @extra_bits contains @tab->ephem_bit. decrements DELETED(@tab) iff the slot
- * written to was a deleted row, and never increments ELEMS(@tab).
+/* initialize for a new @tab. */
+static inline void lfht_iter_init(
+	struct lfht_iter *it, struct lfht_table *tab, size_t hash)
+{
+	size_t mask = (1ul << tab->size_log2) - 1;
+	it->t = tab;
+	it->off = hash & mask;
+	it->end = (it->off + tab->max_probe) & mask;
+	it->hash = hash;
+	it->perfect = tab->perfect_bit;
+}
+
+
+/* attempt to insert an entry for @p which hashes to @it->hash into @it->t
+ * starting at @it->off, not probing farther than @it->end (exclusive). adds
+ * @extra_bits to the created entry, which is copied to *@new_entry_p.
+ * scanning skips over slots that have @it->t->hazard_bit set iff @extra_bits
+ * has @it->t->ephem_bit set.
+ *
+ * returns 0 on success, and advances @it to the position where the new entry
+ * was added; -EAGAIN to indicate that the caller should reload @it->t from
+ * the lfht main table and go again; and -ENOSPC when @it->end was reached.
+ * decrements DELETED(@tab) iff the slot written to was a deleted row, and
+ * never increments ELEMS(@tab).
  */
-static ssize_t ht_add(
+static int ht_add(
 	uintptr_t *new_entry_p,
-	struct lfht_table *tab, const void *p, size_t hash,
-	uintptr_t extra_bits)
+	struct lfht_iter *it, const void *p, uintptr_t extra_bits)
 {
 	assert(new_entry_p != NULL);
-	assert(((uintptr_t)p & tab->common_mask) == tab->common_bits);
-	assert((extra_bits & tab->hazard_bit) == 0);
+	assert(((uintptr_t)p & it->t->common_mask) == it->t->common_bits);
+	assert((extra_bits & it->t->hazard_bit) == 0);
 
-	uintptr_t perfect = tab->perfect_bit;
-	size_t mask = (1ul << tab->size_log2) - 1, start = hash & mask,
-		end = (start + tab->max_probe) & mask,
-		i = start;
+	uintptr_t perfect = it->t->perfect_bit;
+	size_t mask = (1ul << it->t->size_log2) - 1;
 	do {
-		uintptr_t e = atomic_load_explicit(&tab->table[i],
+		uintptr_t e = atomic_load_explicit(&it->t->table[it->off],
 			memory_order_relaxed);
 retry:
-		if(!is_empty(tab, e)) {
-			if((e & tab->mig_bit) != 0) {
-				/* optimization: migration implies @tab is secondary, so
+		if(!is_empty(it->t, e)) {
+			if((e & it->t->mig_bit) != 0) {
+				/* optimization: migration implies @it->t is secondary, so
 				 * ht_add() should be tried again on the primary. this avoids
 				 * an eventual off-cpu migration.
 				 */
 				return -EAGAIN;
 			}
 			/* slot was occupied; go on to the next one. */
-		} else if((e & tab->hazard_bit) == 0
-			|| (extra_bits & tab->ephem_bit) == 0)
+		} else if((e & it->t->hazard_bit) == 0
+			|| (extra_bits & it->t->ephem_bit) == 0)
 		{
-			uintptr_t hval = make_hval(tab, p,
-				get_hash_ptr_bits(tab, hash) | perfect
-					| extra_bits | (e & tab->hazard_bit));
+			uintptr_t hval = make_hval(it->t, p,
+				get_hash_ptr_bits(it->t, it->hash) | perfect
+					| extra_bits | (e & it->t->hazard_bit));
 			*new_entry_p = hval;
-			assert(is_val(tab, hval));
-			assert((e & tab->hazard_bit) == (hval & tab->hazard_bit));
+			assert(is_val(it->t, hval));
+			assert((e & it->t->hazard_bit) == (hval & it->t->hazard_bit));
 			if(!atomic_compare_exchange_strong_explicit(
-				&tab->table[i], &e, hval,
+				&it->t->table[it->off], &e, hval,
 				memory_order_release, memory_order_relaxed))
 			{
 				/* slot was snatched; go again. */
 				goto retry;
 			}
 
-			if(e == tab->del_bit) {
-				atomic_fetch_sub_explicit(&DELETED(tab), 1,
+			if(e == it->t->del_bit) {
+				atomic_fetch_sub_explicit(&DELETED(it->t), 1,
 					memory_order_relaxed);
 			}
-			assert(i >= 0 && i <= SSIZE_MAX);
-			return i;
+			assert(it->off >= 0 && it->off <= SSIZE_MAX);
+			return 0;
 		}
-		i = (i + 1) & mask;
+		it->off = (it->off + 1) & mask;
 		perfect = 0;
-	} while(i != end);
+	} while(it->off != it->end);
 	return -ENOSPC;
 }
 
@@ -696,7 +711,9 @@ static ssize_t ht_mig_mark_and_copy(
 	void *ptr = get_raw_ptr(src, e);
 	size_t hash = (*ht->rehash_fn)(ptr, ht->priv);
 	*hash_p = hash;
-	ssize_t n = ht_add(dstval_p, dst, ptr, hash, dst->ephem_bit);
+	struct lfht_iter it;
+	lfht_iter_init(&it, dst, hash);
+	ssize_t n = ht_add(dstval_p, &it, ptr, dst->ephem_bit);
 	if(unlikely(n < 0)) {
 		/* failure path. unmark source entry. */
 		uintptr_t old_e = e;
@@ -715,6 +732,7 @@ static ssize_t ht_mig_mark_and_copy(
 		e &= ~src->src_bit;
 	} else {
 		atomic_fetch_add(&ELEMS(dst), 1);
+		n = it.off;
 	}
 
 	*entry_p = e;
@@ -1105,7 +1123,7 @@ void lfht_clear(struct lfht *ht)
 }
 
 
-bool lfht_add(struct lfht *ht, size_t hash, void *p)
+bool lfht_add_many(struct lfht *ht, struct lfht_iter *it, void *p)
 {
 	int eck = e_begin();
 
@@ -1118,42 +1136,47 @@ bool lfht_add(struct lfht *ht, size_t hash, void *p)
 			free(tab->table);
 			free(tab);
 			tab = get_main(ht);
+			assert(tab != NULL);
 		}
 	}
+	if(it->t != tab) lfht_iter_init(it, tab, it->hash);
 
 	ssize_t n;
 	do {
-		if(((uintptr_t)p & tab->common_mask) != tab->common_bits) {
-			tab = remask_table(ht, tab, p);
-			if(tab == NULL) goto fail;
-			assert(((uintptr_t)p & tab->common_mask) == tab->common_bits);
+		if(((uintptr_t)p & it->t->common_mask) != it->t->common_bits) {
+			it->t = remask_table(ht, it->t, p);
+			if(it->t == NULL) goto fail;
+			assert(((uintptr_t)p & it->t->common_mask) == it->t->common_bits);
+			lfht_iter_init(it, it->t, it->hash);
 		}
 
 		uintptr_t new_entry;
-		n = ht_add(&new_entry, tab, p, hash, 0);
+		n = ht_add(&new_entry, it, p, 0);
 		if(n == -EAGAIN) {
-			/* @tab became secondary. reload tab'=main and retry to avoid a
+			/* @it->t became secondary. reload main and retry to avoid a
 			 * future off-cpu migration.
 			 */
-			tab = get_main(ht);
+			it->t = get_main(ht);
+			lfht_iter_init(it, it->t, it->hash);
 		} else if(n == -ENOSPC) {
 			/* probe limit was reached. double or rehash the table. */
 			size_t elems, deleted;
-			get_totals(&elems, &deleted, NULL, tab);
-			if(elems + 1 <= tab->max
-				&& elems + 1 + deleted > tab->max_with_deleted)
+			get_totals(&elems, &deleted, NULL, it->t);
+			if(elems + 1 <= it->t->max
+				&& elems + 1 + deleted > it->t->max_with_deleted)
 			{
-				tab = rehash_table(ht, tab);
-				assert(tab != NULL);
+				it->t = rehash_table(ht, it->t);
+				assert(it->t != NULL);
 			} else {
-				tab = double_table(ht, tab, p);
-				if(tab == NULL) goto fail;
+				it->t = double_table(ht, it->t, p);
+				if(it->t == NULL) goto fail;
 			}
+			lfht_iter_init(it, it->t, it->hash);
 		}
 	} while(n < 0);
 	assert(n >= 0);
-	atomic_fetch_add_explicit(&ELEMS(tab), 1, memory_order_relaxed);
-	ht_migrate(ht, tab);
+	atomic_fetch_add_explicit(&ELEMS(it->t), 1, memory_order_relaxed);
+	ht_migrate(ht, it->t);
 
 	e_end(eck);
 	return true;
@@ -1204,19 +1227,6 @@ e_retry:
 		} while(pos != end);
 	}
 	return -ENOENT;
-}
-
-
-/* initialize for a new @tab. */
-static inline void lfht_iter_init(
-	struct lfht_iter *it, struct lfht_table *tab, size_t hash)
-{
-	size_t mask = (1ul << tab->size_log2) - 1;
-	it->t = tab;
-	it->off = hash & mask;
-	it->end = (it->off + tab->max_probe) & mask;
-	it->hash = hash;
-	it->perfect = tab->perfect_bit;
 }
 
 
