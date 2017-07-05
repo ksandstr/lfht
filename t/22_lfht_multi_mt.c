@@ -113,14 +113,14 @@ static void *participant_fn(void *param_ptr)
 	for(size_t i=0, del_pos=0; i < p->num; i++) {
 		char *s = p->strs[(p->first + i) % NUM_STRINGS];
 		size_t hash = str_hash_fn(s, NULL);
+		struct lfht_iter it = LFHT_ADD_ITER(hash);
 		for(int j=0; j < NUM_DUPLICATES; j++) {
-			bool ok = lfht_add(ht, hash, s);
+			bool ok = lfht_add_many(ht, &it, s);
 			assert(ok);
-			if(found_immed && !str_in(ht, hash, s)) {
-				diag("%d: didn't find `%s' right after add j=%d",
-					thread_id, s, j);
-				found_immed = false;
-			}
+		}
+		if(found_immed && !str_in(ht, hash, s)) {
+			diag("%d: didn't find `%s' right after adds", thread_id, s);
+			found_immed = false;
 		}
 
 		if(i - del_pos > 129 + thread_id || i == p->num - 1) {
