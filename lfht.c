@@ -1141,13 +1141,38 @@ bool lfht_add_many(struct lfht *ht, struct lfht_iter *it, void *p)
 	}
 	if(it->t != tab) lfht_iter_init(it, tab, it->hash);
 
-	ssize_t n;
+	int n;
 	do {
 		if(((uintptr_t)p & it->t->common_mask) != it->t->common_bits) {
 			it->t = remask_table(ht, it->t, p);
 			if(it->t == NULL) goto fail;
 			assert(((uintptr_t)p & it->t->common_mask) == it->t->common_bits);
 			lfht_iter_init(it, it->t, it->hash);
+		}
+
+		/* check for need to double or rehash using the per-cpu split
+		 * counters, but not every time.
+		 */
+		_Atomic int *cc = &MY_PERCPU(it->t)->total_check_count;
+		if(atomic_fetch_sub_explicit(cc, 1, memory_order_relaxed) <= 1) {
+			int interval = it->t->max_probe >> (it->t->pc->shift + 4);
+			if(interval < 32) interval = 32;
+			increase_to(cc, interval);
+
+			size_t elems, deleted;
+			get_totals(&elems, &deleted, NULL, it->t);
+			if(elems + 1 <= it->t->max
+				&& elems + 1 + deleted > it->t->max_with_deleted)
+			{
+				it->t = rehash_table(ht, it->t);
+				assert(it->t != NULL);
+				lfht_iter_init(it, it->t, it->hash);
+			} else if(elems + 1 > it->t->max) {
+call_double:
+				it->t = double_table(ht, it->t, p);
+				if(it->t == NULL) goto fail;
+				lfht_iter_init(it, it->t, it->hash);
+			}
 		}
 
 		uintptr_t new_entry;
@@ -1159,22 +1184,10 @@ bool lfht_add_many(struct lfht *ht, struct lfht_iter *it, void *p)
 			it->t = get_main(ht);
 			lfht_iter_init(it, it->t, it->hash);
 		} else if(n == -ENOSPC) {
-			/* probe limit was reached. double or rehash the table. */
-			size_t elems, deleted;
-			get_totals(&elems, &deleted, NULL, it->t);
-			if(elems + 1 <= it->t->max
-				&& elems + 1 + deleted > it->t->max_with_deleted)
-			{
-				it->t = rehash_table(ht, it->t);
-				assert(it->t != NULL);
-			} else {
-				it->t = double_table(ht, it->t, p);
-				if(it->t == NULL) goto fail;
-			}
-			lfht_iter_init(it, it->t, it->hash);
+			/* probe limit was reached. double the table. */
+			goto call_double;
 		}
 	} while(n < 0);
-	assert(n >= 0);
 	atomic_fetch_add_explicit(&ELEMS(it->t), 1, memory_order_relaxed);
 	ht_migrate(ht, it->t);
 

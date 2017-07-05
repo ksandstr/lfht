@@ -76,8 +76,12 @@ struct lfht_table
 
 struct lfht_table_percpu
 {
-	/* split-sum counters. consistent at `link' or `*table' release. */
-	size_t elems, deleted;
+	size_t elems, deleted;	/* split-sum counters */
+
+	/* things that're not regularly read from off-CPU; they can go on their
+	 * own cache line.
+	 */
+	_Atomic int total_check_count __attribute__((aligned(64)));
 
 	/* monotonically decreasing.
 	 * mig_next can increase iff halt_gen_id > 0.
