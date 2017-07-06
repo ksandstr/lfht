@@ -7,7 +7,6 @@
 #include <assert.h>
 
 #include <ccan/tap/tap.h>
-#include <ccan/compiler/compiler.h>
 
 #include "epoch.h"
 
