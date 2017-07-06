@@ -269,6 +269,13 @@ void e_end(int cookie)
 }
 
 
+int e_resume(int cookie)
+{
+	/* the laziest possible correct implementation. boo! hiss! */
+	return -EBUSY;
+}
+
+
 bool e_inside(void)
 {
 	struct e_client *c = get_client();

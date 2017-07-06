@@ -19,6 +19,16 @@
 extern int e_begin(void);
 extern void e_end(int cookie);
 
+/* try to revalidate a previously-closed epoch bracket. useful for breaking
+ * the rules and getting away with it enough of the time.
+ *
+ * returns -EBUSY if the client should discard old pointers and call e_begin()
+ * again, and >0 (new cookie value) if old pointers have become valid again.
+ * the success return valus is equivalent to that from e_begin(), incl. for
+ * future uses of e_resume().
+ */
+extern int e_resume(int cookie);
+
 /* library code may assert() this, or against it to mark a definite restart
  * point.
  */
