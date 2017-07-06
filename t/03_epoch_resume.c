@@ -59,7 +59,6 @@ int main(void)
 	const int num_useless = 6;
 
 	plan_tests(9);
-	todo_start("impl is a stub");	/* 410,757,864,530 dead electrons */
 
 	pthread_barrier_t *bar = malloc(sizeof *bar);
 	pthread_barrier_init(bar, NULL, num_useless + 1);

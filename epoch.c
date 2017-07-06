@@ -206,28 +206,39 @@ static void maybe_tick(unsigned long epoch, struct e_client *self)
 }
 
 
+static inline int make_cookie(unsigned long epoch, bool nested) {
+	/* avoid overflowing a signed int. */
+	return ((epoch & 0x3fffffff) << 1) | (nested ? 1 : 0);
+}
+
+
 /* TODO: e_begin() and e_end() don't enforce matching cookies under !NDEBUG.
  * they should.
  */
 int e_begin(void)
 {
 	struct e_client *c = get_client();
+	unsigned long epoch;
+	bool nested;
 	if(atomic_fetch_add(&c->active, 1) > 0) {
-		/* nested */
-		return 0;
+		nested = true;
+		epoch = atomic_load_explicit(&c->epoch, memory_order_relaxed);
+	} else {
+		nested = false;
+		/* has to happen in a loop. fortunately this is completely valid. the
+		 * "active" flag up there ensures that this terminates at the latest
+		 * when all other threads in the system have ticked the epoch twice,
+		 * which is better than the indefinite live-locked spinning that'd
+		 * happen without.
+		 */
+		epoch = 0;
+		do {
+			epoch = atomic_load(&global_epoch);
+			atomic_store(&c->epoch, epoch);
+		} while(epoch != atomic_load(&global_epoch));
 	}
 
-	/* has to happen in a loop. fortunately this is completely valid. the
-	 * "active" flag up there ensures that this terminates at the latest when
-	 * all other threads in the system have ticked the epoch twice, which is
-	 * better than the indefinite live-locked spinning that'd happen without.
-	 */
-	unsigned long epoch = 0;
-	do {
-		epoch = atomic_load(&global_epoch);
-		atomic_store(&c->epoch, epoch);
-	} while(epoch != atomic_load(&global_epoch));
-	return 1;
+	return make_cookie(epoch, nested);
 }
 
 
@@ -266,13 +277,26 @@ void e_end(int cookie)
 	}
 	old_active = atomic_fetch_sub(&c->active, 1);
 	assert(old_active > 0);
+	assert(old_active > 1 || (cookie & 1) == 0);
 }
 
 
 int e_resume(int cookie)
 {
-	/* the laziest possible correct implementation. boo! hiss! */
-	return -EBUSY;
+	unsigned long epoch = atomic_load_explicit(&global_epoch,
+		memory_order_relaxed);
+	if(cookie >> 1 != (epoch & 0x3fffffff)) return -EBUSY;
+
+	struct e_client *c = get_client();
+	bool nested = atomic_fetch_add(&c->active, 1) > 0;
+	atomic_store(&c->epoch, epoch);
+	if(!nested && atomic_load(&global_epoch) != epoch) {
+		/* there was a tick in between, so ours didn't take. */
+		atomic_fetch_sub(&c->active, 1);
+		return -EBUSY;
+	} else {
+		return make_cookie(epoch, nested);
+	}
 }
 
 
