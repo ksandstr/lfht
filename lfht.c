@@ -711,11 +711,17 @@ static ssize_t ht_mig_mark_and_copy(
 	void *ptr = get_raw_ptr(src, e);
 	size_t hash = (*ht->rehash_fn)(ptr, ht->priv);
 	*hash_p = hash;
-	struct lfht_iter it;
-	lfht_iter_init(&it, dst, hash);
+	static _Thread_local struct lfht_iter it = { };
+	static _Thread_local int eck = 0;
+	if(it.t != dst || it.hash != hash || (eck = e_resume(eck)) < 0) {
+		eck = e_begin();
+		lfht_iter_init(&it, dst, hash);
+	}
 	ssize_t n = ht_add(dstval_p, &it, ptr, dst->ephem_bit);
 	if(unlikely(n < 0)) {
-		/* failure path. unmark source entry. */
+		/* failure path. unmark source entry. no need to handle -EAGAIN; it'll
+		 * pass through unless overridden by the delete case (below).
+		 */
 		uintptr_t old_e = e;
 		if(!atomic_compare_exchange_strong(
 			&src->table[spos], &e, e & ~src->src_bit))
@@ -727,7 +733,7 @@ static ssize_t ht_mig_mark_and_copy(
 			atomic_store(&src->table[spos], mig_val(src));
 			atomic_fetch_sub(&src_pc->elems, 1);
 			*entry_p = mig_val(src);
-			return -ENOENT;
+			n = -ENOENT;	/* conceals ht_add()'s error, which is fine. */
 		}
 		e &= ~src->src_bit;
 	} else {
@@ -735,6 +741,7 @@ static ssize_t ht_mig_mark_and_copy(
 		n = it.off;
 	}
 
+	e_end(eck);
 	*entry_p = e;
 	return n;
 }
