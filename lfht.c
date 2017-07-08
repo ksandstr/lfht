@@ -645,6 +645,34 @@ static void *ht_val(
 }
 
 
+/* check elems & deleted on @t. return zero if @t isn't too full yet, -1 when
+ * it could use a rehash (because of many deleted slots), and 1 when it's too
+ * full of valid entries.
+ */
+static int ht_full_test(struct lfht_table *t)
+{
+	/* but let's not read other CPUs' stuff all the time. that'd defeat the
+	 * point of having split counters.
+	 */
+	_Atomic int *cc = &MY_PERCPU(t)->total_check_count;
+	if(atomic_fetch_sub_explicit(cc, 1, memory_order_relaxed) <= 1) {
+		int interval = t->max_probe >> (t->pc->shift + 4);
+		if(interval < 32) interval = 32;
+		increase_to(cc, interval);
+
+		size_t elems, deleted;
+		get_totals(&elems, &deleted, NULL, t);
+		if(elems + 1 <= t->max && elems + 1 + deleted > t->max_with_deleted) {
+			return -1;
+		} else if(elems + 1 > t->max) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+
 static ssize_t ht_mig_filter(
 	struct lfht_table *src, ssize_t spos, uintptr_t *entry_p)
 {
@@ -943,7 +971,12 @@ e_retry:
 	if(n <= 0) return n;	/* simple completion and skipping. */
 
 dst_retry:
-	n = ht_mig_mark_and_copy(&hash, &dstval, ht, dst, src, src_pc, spos, &e);
+	n = ht_full_test(dst);
+	if(n != 0) n = -ENOSPC;	/* halts migration until next main. */
+	else {
+		n = ht_mig_mark_and_copy(&hash, &dstval, ht, dst,
+			src, src_pc, spos, &e);
+	}
 	if(unlikely(n < 0)) {
 		struct lfht_table *rarest = get_main(ht);
 		if(n == -EINVAL) goto e_retry;	/* `e' was reloaded. try again. */
@@ -1157,29 +1190,16 @@ bool lfht_add_many(struct lfht *ht, struct lfht_iter *it, void *p)
 			lfht_iter_init(it, it->t, it->hash);
 		}
 
-		/* check for need to double or rehash using the per-cpu split
-		 * counters, but not every time.
-		 */
-		_Atomic int *cc = &MY_PERCPU(it->t)->total_check_count;
-		if(atomic_fetch_sub_explicit(cc, 1, memory_order_relaxed) <= 1) {
-			int interval = it->t->max_probe >> (it->t->pc->shift + 4);
-			if(interval < 32) interval = 32;
-			increase_to(cc, interval);
-
-			size_t elems, deleted;
-			get_totals(&elems, &deleted, NULL, it->t);
-			if(elems + 1 <= it->t->max
-				&& elems + 1 + deleted > it->t->max_with_deleted)
-			{
-				it->t = rehash_table(ht, it->t);
-				assert(it->t != NULL);
-				lfht_iter_init(it, it->t, it->hash);
-			} else if(elems + 1 > it->t->max) {
+		int d = ht_full_test(it->t);
+		if(d < 0) {
+			it->t = rehash_table(ht, it->t);
+			assert(it->t != NULL);
+			lfht_iter_init(it, it->t, it->hash);
+		} else if(d > 0) {
 call_double:
-				it->t = double_table(ht, it->t, p);
-				if(it->t == NULL) goto fail;
-				lfht_iter_init(it, it->t, it->hash);
-			}
+			it->t = double_table(ht, it->t, p);
+			if(it->t == NULL) goto fail;
+			lfht_iter_init(it, it->t, it->hash);
 		}
 
 		uintptr_t new_entry;
