@@ -651,25 +651,40 @@ static void *ht_val(
  */
 static int ht_full_test(struct lfht_table *t)
 {
+	int ret = 0;
+
 	/* but let's not read other CPUs' stuff all the time. that'd defeat the
 	 * point of having split counters.
 	 */
 	_Atomic int *cc = &MY_PERCPU(t)->total_check_count;
 	if(atomic_fetch_sub_explicit(cc, 1, memory_order_relaxed) <= 1) {
-		int interval = t->max_probe >> (t->pc->shift + 4);
-		if(interval < 32) interval = 32;
-		increase_to(cc, interval);
-
 		size_t elems, deleted;
 		get_totals(&elems, &deleted, NULL, t);
 		if(elems + 1 <= t->max && elems + 1 + deleted > t->max_with_deleted) {
-			return -1;
+			ret = -1;
 		} else if(elems + 1 > t->max) {
-			return 1;
+			ret = 1;
+		}
+
+		if(ret != 0) {
+			/* cause other threads' ht_full_test()s to fire as well. */
+			for(int base = sched_getcpu() >> t->pc->shift, i = 0;
+				i < t->pc->n_buckets;
+				i++)
+			{
+				struct lfht_table_percpu *pc = percpu_get(t->pc, base ^ i);
+				atomic_store_explicit(&pc->total_check_count, 0,
+					memory_order_relaxed);
+			}
+		} else {
+			/* reëxamine after a delay. */
+			int interval = t->max_probe >> (t->pc->shift + 4);
+			if(interval < 32) interval = 32;
+			increase_to(cc, interval);
 		}
 	}
 
-	return 0;
+	return ret;
 }
 
 
