@@ -139,8 +139,13 @@ static void *participant_fn(void *param_ptr)
 			for(size_t j=0; j < NUM_STRINGS; j++) {
 				char *s = strs[j];
 				size_t hash = hashes[j];
-				while(n_present[j] > 0) {
-					bool ok = lfht_del(ht, hash, s);
+				struct lfht_iter it;
+				for(char *cand = lfht_firstval(ht, &it, hash);
+					cand != NULL && n_present[j] > 0;
+					cand = lfht_nextval(ht, &it, hash))
+				{
+					if(cand != s) continue;
+					bool ok = lfht_delval(ht, &it, s);
 					if(ok) n_present[j]--;
 					else if(res->del_pos_ok && !ok) {
 						diag("%d: didn't delete `%s' when should've (i=%zu, n_present[%zu]=%d)",
