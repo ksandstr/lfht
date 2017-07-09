@@ -7,6 +7,7 @@
 #include <stdalign.h>
 #include <string.h>
 #include <limits.h>
+#include <inttypes.h>
 #include <assert.h>
 #include <sched.h>
 #include <errno.h>
@@ -47,7 +48,7 @@ static struct lfht_table *next_table_gen(
 static inline char *format_entry(
 	char tmp[static 100], struct lfht_table *t, uintptr_t e)
 {
-	snprintf(tmp, 100, "%#lx [%c%c%c%c%c]", e,
+	snprintf(tmp, 100, PRIxPTR " [%c%c%c%c%c]", e,
 		(e & t->src_bit) != 0 ? 's' : '-',
 		(e & t->mig_bit) != 0 ? 'M' : '-',
 		(e & t->hazard_bit) != 0 ? 'h' : '-',
