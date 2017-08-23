@@ -26,7 +26,7 @@ struct lfht_table
 	_Atomic unsigned long halt_gen_id;
 
 	/* constants */
-	uintptr_t *table CACHELINE_ALIGN;	/* allocated separately */
+	_Atomic uintptr_t *table CACHELINE_ALIGN;	/* allocated separately */
 	struct percpu *pc;			/* of <struct lfht_table_percpu> */
 	/* common_mask indicates bits that're the same across all keys;
 	 * common_bits specifies what those bits are.
@@ -76,7 +76,7 @@ struct lfht_table
 
 struct lfht_table_percpu
 {
-	size_t elems, deleted;	/* split-sum counters */
+	_Atomic size_t elems, deleted;	/* split-sum counters */
 
 	/* things that're not regularly read from off-CPU; they can go on their
 	 * own cache line.
@@ -130,11 +130,8 @@ struct lfht_iter {
 
 #define LFHT_ADD_ITER(hash_) ((struct lfht_iter){ .hash = (hash_) })
 
-extern void *lfht_firstval(
-	const struct lfht *ht, struct lfht_iter *it, size_t hash);
-
-extern void *lfht_nextval(
-	const struct lfht *ht, struct lfht_iter *it, size_t hash);
+extern void *lfht_firstval(struct lfht *ht, struct lfht_iter *it, size_t hash);
+extern void *lfht_nextval(struct lfht *ht, struct lfht_iter *it, size_t hash);
 
 /* same as lfht_add(), but when the hash remains the same from call to
  * another, multiset insert becomes O(n) instead of O(n^2). @iter should point
@@ -156,7 +153,7 @@ extern bool lfht_del(struct lfht *ht, size_t hash, const void *p);
  * iteration will go into undefined la-la land.
  */
 static inline void *lfht_get(
-	const struct lfht *ht, size_t hash,
+	struct lfht *ht, size_t hash,
 	bool (*cmp_fn)(const void *cand, void *ptr), const void *ptr)
 {
 	struct lfht_iter it;
@@ -174,7 +171,7 @@ extern void *lfht_next(const struct lfht *ht, struct lfht_iter *it);
 extern void *lfht_prev(const struct lfht *ht, struct lfht_iter *it);
 
 /* returns true if @p was deleted, false otherwise. */
-extern bool lfht_delval(const struct lfht *ht, struct lfht_iter *it, void *p);
+extern bool lfht_delval(struct lfht *ht, struct lfht_iter *it, void *p);
 
 
 #endif

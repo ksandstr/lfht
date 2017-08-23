@@ -40,7 +40,7 @@
 
 
 static struct lfht_table *next_table_gen(
-	const struct lfht *ht, const struct lfht_table *prev, bool filter_halted);
+	struct lfht *ht, struct lfht_table *prev, bool filter_halted);
 
 
 #ifndef NDEBUG
@@ -48,6 +48,7 @@ static struct lfht_table *next_table_gen(
 static inline char *format_entry(
 	char tmp[static 100], struct lfht_table *t, uintptr_t e)
 {
+	/* (methinks clang doth protest overmuch.) */
 	snprintf(tmp, 100, PRIxPTR " [%c%c%c%c%c]", e,
 		(e & t->src_bit) != 0 ? 's' : '-',
 		(e & t->mig_bit) != 0 ? 'M' : '-',
@@ -160,7 +161,7 @@ static inline uintptr_t mig_ptr(
 }
 
 
-static inline struct lfht_table *get_main(const struct lfht *lfht) {
+static inline struct lfht_table *get_main(struct lfht *lfht) {
 	return container_of_or_null(nbsl_top(&lfht->tables),
 		struct lfht_table, link);
 }
@@ -172,7 +173,7 @@ static inline struct lfht_table *get_next(const struct lfht_table *tab) {
 
 
 static void mig_deref(
-	const struct lfht *ht, size_t hash,
+	struct lfht *ht, size_t hash,
 	struct lfht_table **tab_p, size_t *pos_p, uintptr_t *val_p,
 	uintptr_t migptr)
 {
@@ -1286,8 +1287,7 @@ e_retry:
 }
 
 
-static bool find_migrated_val(
-	const struct lfht *ht, struct lfht_iter *it, void *p)
+static bool find_migrated_val(struct lfht *ht, struct lfht_iter *it, void *p)
 {
 	/* (blows when an item's hash changes during its lifetime in @ht.) */
 	assert(it->hash == (*ht->rehash_fn)(p, ht->priv));
@@ -1300,7 +1300,7 @@ static bool find_migrated_val(
 }
 
 
-bool lfht_delval(const struct lfht *ht, struct lfht_iter *it, void *p)
+bool lfht_delval(struct lfht *ht, struct lfht_iter *it, void *p)
 {
 	assert(e_inside());
 
@@ -1387,7 +1387,7 @@ bool lfht_del(struct lfht *ht, size_t hash, const void *p)
  * NULL when @prev is @ht's main table.
  */
 static struct lfht_table *next_table_gen(
-	const struct lfht *ht, const struct lfht_table *prev, bool filter_halted)
+	struct lfht *ht, struct lfht_table *prev, bool filter_halted)
 {
 	unsigned long prev_gen = prev->gen_id;
 	struct lfht_table *t = NULL;
@@ -1410,7 +1410,7 @@ static struct lfht_table *next_table_gen(
 }
 
 
-void *lfht_firstval(const struct lfht *ht, struct lfht_iter *it, size_t hash)
+void *lfht_firstval(struct lfht *ht, struct lfht_iter *it, size_t hash)
 {
 	assert(e_inside());
 
@@ -1440,7 +1440,7 @@ void *lfht_firstval(const struct lfht *ht, struct lfht_iter *it, size_t hash)
 }
 
 
-void *lfht_nextval(const struct lfht *ht, struct lfht_iter *it, size_t hash)
+void *lfht_nextval(struct lfht *ht, struct lfht_iter *it, size_t hash)
 {
 	assert(e_inside());
 

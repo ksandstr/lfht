@@ -55,7 +55,7 @@ struct e_bucket {
 
 
 static _Atomic unsigned long global_epoch = 2;
-static struct percpu *epoch_pc = NULL;
+static struct percpu *_Atomic epoch_pc = NULL;
 static struct nbsl client_list = NBSL_LIST_INIT(client_list);
 static _Atomic bool global_init_flag = false;
 
@@ -318,7 +318,7 @@ void _e_call_dtor(void (*dtor_fn)(void *ptr), void *ptr)
 	/* TODO: use an aligned-chunk allocation scheme for these, since each is
 	 * supposed to be quite small.
 	 */
-	struct e_dtor_call *call = malloc(sizeof(*call));
+	struct e_dtor_call *call = malloc(sizeof *call), *next;
 	call->dtor_fn = dtor_fn;
 	call->ptr = ptr;
 	unsigned long epoch = atomic_load_explicit(&global_epoch,
@@ -327,7 +327,8 @@ void _e_call_dtor(void (*dtor_fn)(void *ptr), void *ptr)
 	struct e_dtor_call *_Atomic *head = &bk->dtor_list[epoch & 3];
 	do {
 		call->next = atomic_load_explicit(head, memory_order_relaxed);
-	} while(!atomic_compare_exchange_weak(head, &call->next, call));
+		next = call->next;
+	} while(!atomic_compare_exchange_weak(head, &next, call));
 	atomic_fetch_add_explicit(&bk->count[epoch & 3], 1,
 		memory_order_release);
 }

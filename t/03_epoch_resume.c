@@ -36,7 +36,7 @@ static void dtor_fn(void *ptr) {
 /* do some wholly useless work. like, allocate memory and so forth. */
 static void *useless_work_fn(void *param_ptr)
 {
-	const struct useless_param *p = param_ptr;
+	struct useless_param *p = param_ptr;
 
 	int n = 0;
 	for(;;) {

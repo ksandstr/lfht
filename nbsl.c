@@ -149,7 +149,7 @@ struct nbsl_node *nbsl_pop(struct nbsl *list)
 }
 
 
-struct nbsl_node *nbsl_top(const struct nbsl *list) {
+struct nbsl_node *nbsl_top(struct nbsl *list) {
 	return n_ptr(atomic_load_explicit(&list->n.next, memory_order_acquire));
 }
 
@@ -200,7 +200,7 @@ static struct nbsl_node *skip_dead_nodes(struct nbsl_iter *it)
 }
 
 
-struct nbsl_node *nbsl_first(const struct nbsl *list, struct nbsl_iter *it)
+struct nbsl_node *nbsl_first(struct nbsl *list, struct nbsl_iter *it)
 {
 	it->prev = (struct nbsl_node *)&list->n;
 	it->cur = n_ptr(atomic_load_explicit(&list->n.next,
@@ -209,7 +209,7 @@ struct nbsl_node *nbsl_first(const struct nbsl *list, struct nbsl_iter *it)
 }
 
 
-struct nbsl_node *nbsl_next(const struct nbsl *list, struct nbsl_iter *it)
+struct nbsl_node *nbsl_next(struct nbsl *list, struct nbsl_iter *it)
 {
 	it->prev = it->cur;
 	it->cur = n_ptr(atomic_load_explicit(&it->prev->next,
