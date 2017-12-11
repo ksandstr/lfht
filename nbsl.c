@@ -83,7 +83,9 @@ static inline void rend_the_marked(
 /* complete removal of @n from flagged parent @prev. */
 static void clear_flag(struct nbsl_node *prev, struct nbsl_node *n)
 {
-	atomic_exchange_explicit(&n->backlink, prev, memory_order_release);
+	struct nbsl_node *old = atomic_exchange_explicit(&n->backlink, prev,
+		memory_order_release);
+	assert(old == NULL || old == prev);
 
 	/* set mark idempotently, load fresh @n->next. */
 	uintptr_t nextval = atomic_load_explicit(&n->next, memory_order_relaxed);
