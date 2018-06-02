@@ -166,9 +166,8 @@ static inline void *lfht_get(
 	return NULL;
 }
 
-extern void *lfht_first(const struct lfht *ht, struct lfht_iter *it);
-extern void *lfht_next(const struct lfht *ht, struct lfht_iter *it);
-extern void *lfht_prev(const struct lfht *ht, struct lfht_iter *it);
+extern void *lfht_first(struct lfht *ht, struct lfht_iter *it);
+extern void *lfht_next(struct lfht *ht, struct lfht_iter *it);
 
 /* returns true if @p was deleted, false otherwise. */
 extern bool lfht_delval(struct lfht *ht, struct lfht_iter *it, void *p);

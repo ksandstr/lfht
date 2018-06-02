@@ -1468,22 +1468,43 @@ void *lfht_nextval(struct lfht *ht, struct lfht_iter *it, size_t hash)
 }
 
 
-void *lfht_first(const struct lfht *ht, struct lfht_iter *it)
+void *lfht_first(struct lfht *ht, struct lfht_iter *it)
 {
 	assert(e_inside());
-	return NULL;
+
+	/* find oldest table. */
+	struct lfht_table *tab = NULL;
+	struct nbsl_iter i;
+	for(struct nbsl_node *cur = nbsl_first(&ht->tables, &i);
+		cur != NULL;
+		cur = nbsl_next(&ht->tables, &i))
+	{
+		tab = container_of(cur, struct lfht_table, link);
+	}
+	if(tab == NULL) {
+		it->t = NULL;
+		return NULL;
+	}
+	*it = (struct lfht_iter){ .t = tab, .end = (1ul << tab->size_log2) - 1 };
+	return lfht_next(ht, it);
 }
 
 
-void *lfht_next(const struct lfht *ht, struct lfht_iter *it)
+void *lfht_next(struct lfht *ht, struct lfht_iter *it)
 {
 	assert(e_inside());
-	return NULL;
-}
+	if(unlikely(it->t == NULL)) return NULL;
 
+	for(;;) {
+		if(it->off == it->end + 1) {
+			it->t = next_table_gen(ht, it->t, false);
+			if(it->t == NULL) return NULL;
+			it->off = 0;
+			it->end = (1ul << it->t->size_log2) - 1;
+		}
 
-void *lfht_prev(const struct lfht *ht, struct lfht_iter *it)
-{
-	assert(e_inside());
-	return NULL;
+		uintptr_t e = atomic_load_explicit(&it->t->table[it->off++],
+			memory_order_relaxed);
+		if(is_val(it->t, e)) return get_raw_ptr(it->t, e);
+	}
 }
