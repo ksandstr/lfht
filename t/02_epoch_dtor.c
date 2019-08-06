@@ -63,7 +63,7 @@ int main(void)
 {
 	plan_tests(3);
 
-	pthread_barrier_t *bar = malloc(sizeof(*bar));
+	pthread_barrier_t *bar = malloc(sizeof *bar);
 	int n = pthread_barrier_init(bar, NULL, 2);
 	assert(n == 0);
 	pthread_t other;
@@ -83,8 +83,8 @@ int main(void)
 		pthread_create(&spams[i], NULL, &spam_thread_fn, NULL);
 	}
 	ok1(dtor_calls == 0);
-	e_end(eck);
 	in_danger = false;
+	e_end(eck);
 	pthread_barrier_wait(bar);
 
 	for(int i=0; i < 4; i++) {
@@ -99,9 +99,9 @@ int main(void)
 	ok(dtor_calls > 0, "dtor should've been called");
 	ok1(dtor_in_danger == 0);
 
+	for(int i=0; i < 12; i++) pthread_join(spams[i], NULL);
 	pthread_barrier_destroy(bar);
 	free(bar);
-	for(int i=0; i < 12; i++) pthread_join(spams[i], NULL);
 
 	return exit_status();
 }
