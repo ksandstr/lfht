@@ -33,7 +33,7 @@ struct e_client
 
 struct e_dtor_call
 {
-	struct e_dtor_call *_Atomic next;
+	struct e_dtor_call *next;
 	void (*dtor_fn)(void *ptr);
 	void *ptr;
 };
@@ -42,13 +42,14 @@ struct e_dtor_call
 /* cpu-split bucket for dtors and dtor counts, per epoch.
  *
  * [epoch + 1 mod 4] = NULL
- * [epoch     mod 4] = fresh dtors, current insert position
- * [epoch - 1 mod 4] = quiet dtors, possibly still under access
+ * [epoch     mod 4] = fresh dtors, current insert
+ * [epoch - 1 mod 4] = quiet dtors, possibly under access, late insert
  * [epoch - 2 mod 4] = in-progress dtors (then NULL)
  */
 struct e_bucket {
-	struct e_dtor_call *_Atomic dtor_list[4];
-	_Atomic unsigned long count[4];
+	_Atomic int lock;	/* per-cpu, cheap and benign */
+	struct e_dtor_call *dtor_list[4];
+	unsigned count[4];
 } __attribute__((aligned(64)));
 
 #define GET_BUCKET() ((struct e_bucket *)percpu_my(epoch_pc))
@@ -63,10 +64,8 @@ static _Atomic bool global_init_flag = false;
 static void e_bucket_ctor(void *ptr)
 {
 	struct e_bucket *b = ptr;
-	for(int j=0; j < 4; j++) {
-		atomic_store_explicit(&b->dtor_list[j], NULL, memory_order_relaxed);
-		atomic_store_explicit(&b->count[j], 0, memory_order_relaxed);
-	}
+	*b = (struct e_bucket){ .lock = 0 };
+	atomic_thread_fence(memory_order_release);
 }
 
 
@@ -134,6 +133,28 @@ static struct e_client *get_client(void)
 }
 
 
+static void lock_bucket(struct e_bucket *bk)
+{
+	int old = 0;
+	while(!atomic_compare_exchange_weak_explicit(&bk->lock, &old, 1,
+		memory_order_acquire, memory_order_relaxed))
+	{
+		/* buckets are mostly per-cpu so there's no point to spinning; most
+		 * likely we're here because another thread on this CPU was scheduled
+		 * off (and will return sooner this way).
+		 */
+		sched_yield();
+		old = 0;
+	}
+}
+
+
+static void unlock_bucket(struct e_bucket *bk) {
+	int old = atomic_exchange_explicit(&bk->lock, 0, memory_order_release);
+	assert(old == 1);
+}
+
+
 static inline unsigned long next_epoch(unsigned long e) {
 	return e != ULONG_MAX ? e + 1 : 2;
 }
@@ -150,25 +171,27 @@ static void tick(unsigned long old_epoch)
 		&oldval, new_epoch, memory_order_release, memory_order_relaxed);
 
 	/* starting from our own CPU, do each dtor list in turn. */
+	int gone = (old_epoch - 2) & 3;
 	for(int base = sched_getcpu() >> epoch_pc->shift, i = 0;
 		i < epoch_pc->n_buckets;
 		i++)
 	{
-		/* once-only is guaranteed by atomic exchange. */
+		/* the ordering is important here; the global epoch must advance
+		 * before bucket locks are taken. this makes e_call_dtor() valid.
+		 */
 		struct e_bucket *bk = percpu_get(epoch_pc, base ^ i);
-		atomic_store_explicit(&bk->count[(old_epoch - 2) & 3], 0,
-			memory_order_relaxed);
-		struct e_dtor_call *dead = atomic_exchange_explicit(
-			&bk->dtor_list[(old_epoch - 2) & 3], NULL,
-			memory_order_acq_rel);
-		if(dead == NULL) continue;
+		lock_bucket(bk);
+		bk->count[gone] = 0;
+		struct e_dtor_call *dead = bk->dtor_list[gone];
+		bk->dtor_list[gone] = NULL;
+		unlock_bucket(bk);
 
 		/* call the list in push order, i.e. reverse it first. */
 		struct e_dtor_call *head = NULL;
 		while(dead != NULL) {
 			struct e_dtor_call *next = dead->next;
 			dead->next = head;
-			head = dead;
+			head = dead;	/* saturday mornings, man */
 			dead = next;
 		}
 		while(head != NULL) {
@@ -318,19 +341,28 @@ void _e_call_dtor(void (*dtor_fn)(void *ptr), void *ptr)
 	/* TODO: use an aligned-chunk allocation scheme for these, since each is
 	 * supposed to be quite small.
 	 */
-	struct e_dtor_call *call = malloc(sizeof *call), *next;
+	struct e_dtor_call *call = malloc(sizeof *call);
 	call->dtor_fn = dtor_fn;
 	call->ptr = ptr;
+
+	/* the ordering is important; the dtor producer must read epoch while
+	 * holding a bucket lock.
+	 *
+	 * this exploits an interaction via the lock where tick() inhibits a
+	 * further epoch tick by spinning, which implies that while a bucket lock
+	 * is held the epoch value will stay at global_epoch or global_epoch - 1,
+	 * which are valid for dtor deposits.
+	 */
+	struct e_bucket *bk = GET_BUCKET();
+	lock_bucket(bk);
 	unsigned long epoch = atomic_load_explicit(&global_epoch,
 		memory_order_acquire);
-	struct e_bucket *bk = GET_BUCKET();
-	struct e_dtor_call *_Atomic *head = &bk->dtor_list[epoch & 3];
-	do {
-		call->next = atomic_load_explicit(head, memory_order_relaxed);
-		next = call->next;
-	} while(!atomic_compare_exchange_weak(head, &next, call));
-	atomic_fetch_add_explicit(&bk->count[epoch & 3], 1,
-		memory_order_release);
+	struct e_dtor_call **head = &bk->dtor_list[epoch & 3];
+	call->next = *head;
+	*head = call;
+	bk->count[epoch & 3]++;
+	assert(epoch >= atomic_load(&global_epoch) - 1);
+	unlock_bucket(bk);
 }
 
 

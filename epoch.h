@@ -34,8 +34,8 @@ extern int e_resume(int cookie);
  */
 extern bool e_inside(void);
 
-/* it makes very little sense to call these from outside an epoch bracket, but
- * it's ok where necessary. (e.g. the per-client destructor.)
+/* it's permitted to call e_call_dtor() and e_free() from outside an epoch
+ * bracket.
  */
 #define e_call_dtor(fn, ptr) \
 	_e_call_dtor(typesafe_cb(void, void *, (fn), (ptr)), (ptr))
