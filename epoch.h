@@ -1,11 +1,8 @@
+#ifndef _EPOCH_H
+#define _EPOCH_H
 
-#ifndef EPOCH_H
-#define EPOCH_H
-
-#include <stdlib.h>
 #include <stdbool.h>
 #include <ccan/typesafe_cb/typesafe_cb.h>
-
 
 /* start or end an epoch bracket. recursive; the protected period ends with
  * the call to the outermost e_end(). cookies are used to enforce begin-end
@@ -37,22 +34,10 @@ extern bool e_inside(void);
 /* it's permitted to call e_call_dtor() and e_free() from outside an epoch
  * bracket.
  */
-#define e_call_dtor(fn, ptr) \
-	_e_call_dtor(typesafe_cb(void, void *, (fn), (ptr)), (ptr))
+#define e_call_dtor(fn, ptr) _e_call_dtor(typesafe_cb(void, void *, (fn), (ptr)), (ptr))
 extern void _e_call_dtor(void (*dtor_fn)(void *), void *ptr);
 
-/* wrapper for free(3). */
+/* wrapper of e_call_dtor(&free, @ptr). */
 extern void e_free(void *ptr);
-
-
-/* interface to the C runtime: returns a per-thread free(3)able block of @size
- * bytes, initialized to all zeroes and released with a call to @dtor at
- * thread exit. may never return NULL.
- *
- * default implementation in epoch_pthread.c uses pthread TLS, but things like
- * OS kernels can link in a per-CPU setup instead (and never call @dtor).
- */
-extern void *e_ext_get(size_t size, void (*dtor_fn)(void *ptr));
-
 
 #endif
